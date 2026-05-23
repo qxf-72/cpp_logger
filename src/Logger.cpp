@@ -43,12 +43,13 @@ void Logger::log(LogLevel level,
                  int line,
                  const std::string &message)
 {
+
+    std::lock_guard<std::mutex> lock(mutex_);
+
     if (static_cast<int>(level) < static_cast<int>(minLevel_))
     {
         return;
     }
-
-    std::lock_guard<std::mutex> lock(mutex_);
 
     if (!initialized_)
     {
