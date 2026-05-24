@@ -6,23 +6,21 @@
 #include <mutex>
 
 // 日志等级。数值越大，等级越高。
-enum class LogLevel
-{
+enum class LogLevel {
     DEBUG = 0,
     INFO,
     WARN,
     ERROR
 };
 
-class Logger
-{
+class Logger {
 public:
     // 获取全局唯一的 Logger 实例。
-    static Logger &instance();
+    static Logger& instance();
 
     // 初始化日志文件。
     // 返回 true 表示日志文件打开成功，false 表示初始化失败。
-    bool init(const std::string &filename, LogLevel minLevel = LogLevel::DEBUG);
+    bool init(const std::string& filename, LogLevel minLevel = LogLevel::DEBUG);
 
     // 设置最低输出日志等级。
     // 低于该等级的日志会被忽略。
@@ -30,13 +28,13 @@ public:
 
     // 写入一条日志。
     // file 和 line 通常由 LOG_xxx 宏自动传入。
-    void log(LogLevel level, const char *file, int line, const std::string &message);
+    void log(LogLevel level, const char* file, int line, const std::string& message);
 
     // 禁止拷贝和赋值，避免产生多个 Logger 实例。
-    Logger(const Logger &) = delete;
-    Logger &operator=(const Logger &) = delete;
-    Logger(Logger &&) = delete;
-    Logger &operator=(Logger &&) = delete;
+    Logger(const Logger&) = delete;
+    Logger& operator=(const Logger&) = delete;
+    Logger(Logger&&) = delete;
+    Logger& operator=(Logger&&) = delete;
 
 private:
     Logger() = default;

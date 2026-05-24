@@ -6,23 +6,19 @@
 #include <sstream>
 #include <thread>
 
-Logger &Logger::instance()
-{
+Logger& Logger::instance() {
     static Logger logger;
     return logger;
 }
 
-Logger::~Logger()
-{
+Logger::~Logger() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (out_.is_open())
-    {
+    if (out_.is_open()) {
         out_.close();
     }
 }
 
-bool Logger::init(const std::string &filename, LogLevel minLevel)
-{
+bool Logger::init(const std::string& filename, LogLevel minLevel) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     minLevel_ = minLevel;
@@ -32,42 +28,36 @@ bool Logger::init(const std::string &filename, LogLevel minLevel)
     return initialized_;
 }
 
-void Logger::setLevel(LogLevel level)
-{
+void Logger::setLevel(LogLevel level) {
     std::lock_guard<std::mutex> lock(mutex_);
     minLevel_ = level;
 }
 
 void Logger::log(LogLevel level,
-                 const char *file,
-                 int line,
-                 const std::string &message)
-{
+    const char* file,
+    int line,
+    const std::string& message) {
 
     std::lock_guard<std::mutex> lock(mutex_);
 
-    if (static_cast<int>(level) < static_cast<int>(minLevel_))
-    {
+    if (static_cast<int>(level) < static_cast<int>(minLevel_)) {
         return;
     }
 
-    if (!initialized_)
-    {
+    if (!initialized_) {
         return;
     }
 
     out_ << "[" << currentTime() << "]"
-         << "[" << levelToString(level) << "]"
-         << "[tid:" << std::this_thread::get_id() << "]"
-         << "[" << file << ":" << line << "] "
-         << message
-         << std::endl;
+        << "[" << levelToString(level) << "]"
+        << "[tid:" << std::this_thread::get_id() << "]"
+        << "[" << file << ":" << line << "] "
+        << message
+        << std::endl;
 }
 
-std::string Logger::levelToString(LogLevel level)
-{
-    switch (level)
-    {
+std::string Logger::levelToString(LogLevel level) {
+    switch (level) {
     case LogLevel::DEBUG:
         return "DEBUG";
     case LogLevel::INFO:
@@ -81,8 +71,7 @@ std::string Logger::levelToString(LogLevel level)
     }
 }
 
-std::string Logger::currentTime()
-{
+std::string Logger::currentTime() {
     auto now = std::chrono::system_clock::now();
     auto time = std::chrono::system_clock::to_time_t(now);
 
