@@ -2,8 +2,10 @@
 #define BLOCKING_QUEUE_H
 
 #include <condition_variable>
+#include <cstddef>
 #include <mutex>
 #include <queue>
+#include <utility>
 
 template <typename T>
 class BlockingQueue {
@@ -13,22 +15,34 @@ public:
     BlockingQueue(const BlockingQueue&) = delete;
     BlockingQueue& operator=(const BlockingQueue&) = delete;
 
-    void push(const T& value) {
+    bool push(const T& value) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
+
+            if (closed_) {
+                return false;
+            }
+
             queue_.push(value);
         }
 
         cv_.notify_one();
+        return true;
     }
 
-    void push(T&& value) {
+    bool push(T&& value) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
+
+            if (closed_) {
+                return false;
+            }
+
             queue_.push(std::move(value));
         }
 
         cv_.notify_one();
+        return true;
     }
 
     bool pop(T& value) {
@@ -62,9 +76,14 @@ public:
         return queue_.empty();
     }
 
-    size_t size() const {
+    std::size_t size() const {
         std::lock_guard<std::mutex> lock(mutex_);
         return queue_.size();
+    }
+
+    bool closed() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return closed_;
     }
 
 private:
