@@ -1,5 +1,9 @@
 # C++ Linux 异步日志系统
 
+![GitHub License](https://img.shields.io/github/license/qxf-72/cpp_logger)
+![GitHub top language](https://img.shields.io/github/languages/top/qxf-72/cpp_logger)
+![GitHub Repo stars](https://img.shields.io/github/stars/qxf-72/cpp_logger)
+
 ## 项目简介
 
 本项目是一个基于 C++11 实现的 Linux 多线程异步日志系统，支持日志级别过滤、时间戳、线程 ID、源码文件名与行号输出。
