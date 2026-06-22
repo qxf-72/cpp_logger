@@ -2,7 +2,7 @@
 
 ![GitHub License](https://img.shields.io/github/license/qxf-72/cpp_logger)
 ![GitHub top language](https://img.shields.io/github/languages/top/qxf-72/cpp_logger)
-![GitHub Repo stars](https://img.shields.io/github/stars/qxf-72/cpp_logger)
+
 
 ## 项目简介
 
@@ -37,10 +37,9 @@ cpp_logger/
 ## 编译运行
 
 ```bash
-mkdir build
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
 cd build
-cmake ..
-make
 ./logger_demo
 ```
 
