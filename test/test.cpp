@@ -42,11 +42,10 @@ int main() {
   LOG_INFO("async logger started");
 
   std::vector<ThreadGuard> guards;
-  guards.reserve(5);  // 预分配空间，避免重新分配时的移动问题
+  guards.reserve(5);
 
   // 同时启动所有线程
   for (int i = 0; i < 5; ++i) {
-    // 使用 emplace_back 直接在 vector 中构造 ThreadGuard
     guards.emplace_back(std::thread([i] {
       for (int j = 0; j < 5; ++j) {
         LOG_INFO("thread " + std::to_string(i) + " writes log " + std::to_string(j));
@@ -61,6 +60,7 @@ int main() {
 
   LOG_WARN("all worker threads finished");
   LOG_ERROR("this is a test error message");
+  LOG_FATAL("this is a test fatal message");
 
   Logger::instance().stop();
 

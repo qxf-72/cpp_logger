@@ -9,7 +9,7 @@
 
 #include "BlockingQueue.h"
 
-enum class LogLevel { DEBUG = 0, INFO, WARN, ERROR };
+enum class LogLevel { DEBUG = 0, INFO, WARN, ERROR, FATAL };
 
 class Logger {
  public:
@@ -45,13 +45,14 @@ class Logger {
 
   std::mutex initMutex_;
 
-  std::atomic<int> minLevel_{static_cast<int>(LogLevel::DEBUG)};
-  std::atomic<bool> running_{false};
+  std::atomic_int minLevel_{static_cast<int>(LogLevel::DEBUG)};
+  std::atomic_bool running_{false};
 };
 
 #define LOG_DEBUG(msg) Logger::instance().log(LogLevel::DEBUG, __FILE__, __LINE__, (msg))
 #define LOG_INFO(msg) Logger::instance().log(LogLevel::INFO, __FILE__, __LINE__, (msg))
 #define LOG_WARN(msg) Logger::instance().log(LogLevel::WARN, __FILE__, __LINE__, (msg))
 #define LOG_ERROR(msg) Logger::instance().log(LogLevel::ERROR, __FILE__, __LINE__, (msg))
+#define LOG_FATAL(msg) Logger::instance().log(LogLevel::FATAL, __FILE__, __LINE__, (msg))
 
 #endif
