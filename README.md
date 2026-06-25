@@ -4,120 +4,184 @@
 ![GitHub top language](https://img.shields.io/github/languages/top/qxf-72/cpp_logger)
 
 
-## 项目简介
+一个基于 C++11 实现的轻量级 Linux 多线程异步日志系统。
 
-本项目是一个基于 C++11 实现的 Linux 多线程异步日志系统，支持日志级别过滤、时间戳、线程 ID、源码文件名与行号输出。
+业务线程负责格式化日志并写入 `BlockingQueue`，后台线程负责日志落盘，从而降低文件 IO 对业务线程的阻塞。
 
-项目使用 `BlockingQueue` 和后台日志线程实现异步写入：业务线程只负责生成日志并写入阻塞队列，文件 IO 由后台线程完成，从而减少日志写入对业务线程的阻塞。
+## ✨ 功能特性
 
-## 当前功能
+- 支持 `DEBUG / INFO / WARN / ERROR / FATAL` 五种日志级别
+- 支持日志级别过滤，避免无效日志的字符串构造
+- 支持毫秒级时间戳
+- 支持记录线程 ID、源码文件名和行号
+- 支持 `LOG_INFO("message")` 等宏调用方式
+- 基于 `BlockingQueue` 实现生产者—消费者模型
+- 使用后台线程异步写入日志
+- 支持按日期自动滚动日志文件
+- 支持按文件大小自动滚动日志文件
+- 支持安全停止并写完队列中的剩余日志
+- 使用 CMake 构建静态库和测试程序
 
-- 支持 DEBUG / INFO / WARN / ERROR 四种日志级别
-- 支持日志级别过滤
-- 支持输出时间戳、线程 ID、源码文件名和行号
-- 支持宏调用方式，例如 `LOG_INFO("message")`
-- 基于 `BlockingQueue` 实现生产者-消费者模型
-- 使用后台线程异步写入日志文件
-- 支持程序退出时安全停止后台线程并刷新剩余日志
-- 使用 CMake 构建项目
-
-## 项目结构
+## 📁 项目结构
 
 ```text
 cpp_logger/
-├── CMakeLists.txt
 ├── include/
 │   ├── BlockingQueue.h
 │   └── Logger.h
-└── src/
-    ├── Logger.cpp
-    └── main.cpp
+├── src/
+│   └── Logger.cpp
+├── test/
+│   └── test.cpp
+├── CMakeLists.txt
+├── LICENSE
+└── README.md
 ```
 
-## 编译运行
+## 🚀 编译运行
+
+### 环境要求
+
+- Linux
+- C++11 或更高版本
+- CMake 3.10 或更高版本
+- GCC 或 Clang
+
+### 构建项目
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+git clone https://github.com/qxf-72/cpp_logger.git
+cd cpp_logger
+
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
+```
+
+构建完成后会生成：
+
+```text
+build/
+├── liblogger.a
+└── logger_demo
+```
+
+### 运行示例
+
+```bash
 cd build
 ./logger_demo
 ```
 
-程序运行后会在 `build/` 目录下生成日志文件：
-
-```text
-app.log
-```
-
-查看日志：
+查看生成的日志文件：
 
 ```bash
-tail -n 20 app.log
+ls app_*.log
+tail -n 20 app_*.log
 ```
 
-## 使用示例
+## 📖 使用示例
 
 ```cpp
 #include "Logger.h"
 
 int main() {
-    Logger::instance().init("app.log", LogLevel::DEBUG);
+  // 参数依次为：
+  // 日志文件前缀、最低日志级别、单个文件大小上限
+  if (!Logger::instance().init(
+          "app", LogLevel::DEBUG, 10 * 1024 * 1024)) {
+    return 1;
+  }
 
-    LOG_INFO("program started");
-    LOG_WARN("this is a warning");
-    LOG_ERROR("something wrong");
+  LOG_DEBUG("debug message");
+  LOG_INFO("program started");
+  LOG_WARN("warning message");
+  LOG_ERROR("error message");
+  LOG_FATAL("fatal message");
 
-    Logger::instance().stop();
-
-    return 0;
+  Logger::instance().stop();
+  return 0;
 }
 ```
 
-## 日志格式
+## 📝 日志格式
 
 ```text
-[2026-05-25 12:00:00.123][INFO][tid:140123456789000][../src/main.cpp:18] message
+[2026-06-25 12:00:00.123][INFO][tid:140123456789000][../test/test.cpp:42] message
 ```
 
-字段含义：
+格式说明：
 
 ```text
-[时间][日志级别][线程ID][源码文件:行号] 日志内容
+[时间][日志级别][线程 ID][源码文件:行号] 日志内容
 ```
 
-## 核心设计
+## 🗂️ 日志滚动
 
-同步日志中，业务线程需要直接写文件：
+日志文件名格式：
 
 ```text
-业务线程 -> 加锁 -> 写文件
+文件前缀_日期_序号.log
 ```
 
-本项目采用异步日志模型：
+示例：
 
 ```text
-业务线程 -> 生成日志 -> 写入 BlockingQueue -> 立即返回
-后台线程 -> 从 BlockingQueue 取日志 -> 写入文件
+app_2026-06-25_0.log
+app_2026-06-25_1.log
+app_2026-06-26_0.log
 ```
 
-`BlockingQueue` 使用 `std::mutex` 保证队列线程安全，使用 `std::condition_variable` 在队列为空时阻塞后台线程，避免忙等。
+滚动规则：
 
-程序退出时，`Logger::stop()` 会关闭队列、唤醒后台线程、等待剩余日志写入完成，并最终关闭日志文件。
+- 日期改变时，创建新日期的 `0` 号日志文件
+- 当前日志文件达到大小上限时，递增文件序号
+- 同一天内可以生成多个日志文件
 
-## 后续计划
+## 🏗️ 核心设计
 
-- 支持日志文件按大小滚动
-- 支持按日期切分日志文件
-- 添加 benchmark 性能测试
-- 支持最大队列长度限制
-- 支持控制台输出
-- 封装为可复用日志库
+```text
+业务线程
+  └── 格式化日志
+        └── 写入 BlockingQueue
+              └── 立即返回
 
-## 开发环境
+后台日志线程
+  └── 从 BlockingQueue 取出日志
+        └── 判断是否需要滚动
+              └── 写入日志文件
+```
 
-- Linux
-- C++11
-- CMake
-- pthread
+`BlockingQueue` 使用：
+
+- `std::mutex` 保护共享队列
+- `std::condition_variable` 实现消费者阻塞等待
+- `close()` 唤醒后台线程并完成安全退出
+
+调用 `Logger::stop()` 后，队列不再接收新日志，后台线程会处理完已有日志，再刷新并关闭文件。
+
+## 🛣️ 后续计划
+
+- [ ] 添加同步与异步日志性能测试
+- [ ] 支持阻塞队列容量上限
+- [ ] 支持控制台输出
+- [ ] 添加单元测试
+- [ ] 支持日志文件自动清理
+- [ ] 支持安装和导出 CMake package
+
+## 🤝 Contributing
+
+欢迎提交 Issue 和 Pull Request。
+
+提交代码前，请确保：
+
+```bash
+cmake --build build
+```
+
+能够正常完成，并保持代码格式统一。
+
+## 📄 License
+
+本项目使用 MIT License。
 
 ---
