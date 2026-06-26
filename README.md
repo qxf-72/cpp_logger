@@ -1,12 +1,20 @@
+<div align="center">
+
 # C++ Linux 异步日志系统
-
-![GitHub License](https://img.shields.io/github/license/qxf-72/cpp_logger)
-![GitHub top language](https://img.shields.io/github/languages/top/qxf-72/cpp_logger)
-
 
 一个基于 C++11 实现的轻量级 Linux 多线程异步日志系统。
 
 业务线程负责格式化日志并写入 `BlockingQueue`，后台线程负责日志落盘，从而降低文件 IO 对业务线程的阻塞。
+
+![C++](https://img.shields.io/badge/C%2B%2B-11-blue.svg)
+![CMake](https://img.shields.io/badge/CMake-3.10%2B-brightgreen.svg)
+![GitHub top language](https://img.shields.io/github/languages/top/qxf-72/cpp_logger)
+![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey.svg)
+![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+
+⭐ 如果这个项目对你有帮助，欢迎点一个 Star！
+
+</div>
 
 ## ✨ 功能特性
 
@@ -184,4 +192,3 @@ cmake --build build
 
 本项目使用 MIT License。
 
----
