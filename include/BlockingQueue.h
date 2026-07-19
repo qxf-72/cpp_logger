@@ -3,91 +3,212 @@
 
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <type_traits>
 #include <utility>
+#include <vector>
+
+// 队列达到容量上限时的处理方式。
+enum class OverflowPolicy { Block, DropNewest, DropOldest };
+
+// 入队结果区分关闭和溢出丢弃，便于上层准确统计丢弃日志。
+enum class QueuePushResult { Enqueued, DroppedNewest, DroppedOldest, Closed };
 
 template <typename T>
 class BlockingQueue {
- private:
-  mutable std::mutex mtx_;
-  std::condition_variable cv_;
-  std::queue<T> que_;
-  bool close_{false};
-
  public:
   BlockingQueue() = default;
-  BlockingQueue& operator=(const BlockingQueue&) = delete;
   BlockingQueue(const BlockingQueue&) = delete;
+  BlockingQueue& operator=(const BlockingQueue&) = delete;
 
-  // 支持左值和右值入队：对 string 这类对象可以避免一次不必要的拷贝。
-  // 返回 false 表示队列已经关闭，调用方应停止继续投递新任务。
-  template <typename U,
-            typename = typename std::enable_if<std::is_constructible<T, U&&>::value>::type>
-  bool push(U&& value) {
-    {
-      std::lock_guard<std::mutex> lock(mtx_);
-      if (close_) {
-        return false;
-      }
-      que_.emplace(std::forward<U>(value));
-    }
-
-    cv_.notify_one();
-    return true;
+  // 使用当前代次入队，供独立使用 BlockingQueue 的场景调用。
+  template <typename U, std::enable_if_t<std::is_constructible_v<T, U&&>, int> = 0>
+  [[nodiscard]] QueuePushResult push(U&& value) {
+    std::unique_lock lock(mutex_);
+    return pushLocked(lock, generation_, std::forward<U>(value));
   }
 
-  // 阻塞式出队：
-  // 1. 队列为空且未关闭时，消费者线程会在条件变量上等待。
-  // 2. 队列关闭后仍会先取完剩余元素，只有队列真的为空时才返回 false。
-  bool pop(T& val) {
-    std::unique_lock<std::mutex> lock(mtx_);
-    cv_.wait(lock, [this]() -> bool { return close_ || !que_.empty(); });
+  // expectedGeneration 用于 Logger 的生命周期同步：重启后，旧运行周期中尚未完成的
+  // 生产者不会把消息写入新队列。
+  template <typename U, std::enable_if_t<std::is_constructible_v<T, U&&>, int> = 0>
+  [[nodiscard]] QueuePushResult push(std::size_t expectedGeneration, U&& value) {
+    std::unique_lock lock(mutex_);
+    return pushLocked(lock, expectedGeneration, std::forward<U>(value));
+  }
 
-    if (que_.empty()) {
+  // 队列关闭且元素已取尽时返回 std::nullopt；关闭前已入队的元素仍会被正常消费。
+  [[nodiscard]] std::optional<T> pop() {
+    std::unique_lock lock(mutex_);
+    notEmpty_.wait(lock, [this] { return closed_ || !queue_.empty(); });
+
+    if (queue_.empty()) {
+      return std::nullopt;
+    }
+
+    T value = std::move(queue_.front());
+    queue_.pop();
+    lock.unlock();
+    // 为 Block 策略中等待空位的生产者腾出一个位置。
+    notFull_.notify_one();
+    return value;
+  }
+
+  // 一次取出至多 maxCount 个元素，减少消费者频繁加锁和上下文切换的开销。
+  // 队列关闭且已排空时返回 false。
+  [[nodiscard]] bool popBatch(std::vector<T>& values, std::size_t maxCount) {
+    values.clear();
+    if (maxCount == 0) {
       return false;
     }
 
-    val = std::move(que_.front());
-    que_.pop();
+    std::unique_lock lock(mutex_);
+    notEmpty_.wait(lock, [this] { return closed_ || !queue_.empty(); });
 
+    if (queue_.empty()) {
+      return false;
+    }
+
+    if (values.capacity() < maxCount) {
+      values.reserve(maxCount);
+    }
+    for (std::size_t index = 0; index < maxCount && !queue_.empty(); ++index) {
+      values.emplace_back(std::move(queue_.front()));
+      queue_.pop();
+    }
+    lock.unlock();
+    // 可能一次释放了多个空位，唤醒所有等待的 Block 生产者。
+    notFull_.notify_all();
     return true;
   }
 
-  // 关闭队列并唤醒所有等待线程。
-  // 关闭后 push 会失败，但 pop 仍允许消费队列中已经存在的数据。
+  // 唤醒消费者与因队列已满而阻塞的生产者。
   void close() {
     {
-      std::lock_guard<std::mutex> lock(mtx_);
-      close_ = true;
+      std::scoped_lock lock(mutex_);
+      closed_ = true;
     }
-    cv_.notify_all();
+    notEmpty_.notify_all();
+    notFull_.notify_all();
   }
 
-  // 重新打开队列，供 Logger 在 stop() 之后再次 init() 使用。
-  // reset 会清空残留数据，避免上一次运行未消费完的日志污染下一次运行。
+  // 保留旧接口的无容量上限语义，便于 BlockingQueue 独立使用时迁移。
   void reset() {
-    std::lock_guard<std::mutex> lock(mtx_);
-    std::queue<T> empty;
-    que_.swap(empty);
-    close_ = false;
+    reset(std::numeric_limits<std::size_t>::max(), OverflowPolicy::Block);
   }
 
-  bool empty() const {
-    std::lock_guard<std::mutex> lock(mtx_);
-    return que_.empty();
+  // Logger 仅会在旧 worker 已退出后调用。每次重置都会开始一个新代次并清空统计数据。
+  void reset(std::size_t capacity, OverflowPolicy overflowPolicy) {
+    std::scoped_lock lock(mutex_);
+    std::queue<T>{}.swap(queue_);
+    // Logger 会拒绝容量为 0 的配置；此处仍做防御性保护，避免独立使用时永久阻塞。
+    capacity_ = capacity == 0 ? 1 : capacity;
+    overflowPolicy_ = overflowPolicy;
+    highWaterMark_ = 0;
+    droppedCount_ = 0;
+    closed_ = false;
+    ++generation_;
+    notEmpty_.notify_all();
+    notFull_.notify_all();
   }
 
-  std::size_t size() const {
-    std::lock_guard<std::mutex> lock(mtx_);
-    return que_.size();
+  [[nodiscard]] bool empty() const {
+    std::scoped_lock lock(mutex_);
+    return queue_.empty();
   }
 
-  bool closed() const {
-    std::lock_guard<std::mutex> lock(mtx_);
-    return close_;
+  [[nodiscard]] std::size_t size() const {
+    std::scoped_lock lock(mutex_);
+    return queue_.size();
   }
+
+  [[nodiscard]] std::size_t peakSize() const {
+    std::scoped_lock lock(mutex_);
+    return highWaterMark_;
+  }
+
+  [[nodiscard]] std::uint64_t droppedCount() const {
+    std::scoped_lock lock(mutex_);
+    return droppedCount_;
+  }
+
+  [[nodiscard]] std::size_t capacity() const {
+    std::scoped_lock lock(mutex_);
+    return capacity_;
+  }
+
+  [[nodiscard]] OverflowPolicy overflowPolicy() const {
+    std::scoped_lock lock(mutex_);
+    return overflowPolicy_;
+  }
+
+  [[nodiscard]] std::size_t generation() const {
+    std::scoped_lock lock(mutex_);
+    return generation_;
+  }
+
+  [[nodiscard]] bool closed() const {
+    std::scoped_lock lock(mutex_);
+    return closed_;
+  }
+
+ private:
+  template <typename U>
+  QueuePushResult pushLocked(std::unique_lock<std::mutex>& lock, std::size_t expectedGeneration,
+                             U&& value) {
+    if (closed_ || expectedGeneration != generation_) {
+      return QueuePushResult::Closed;
+    }
+
+    if (overflowPolicy_ == OverflowPolicy::Block) {
+      notFull_.wait(lock, [this, expectedGeneration] {
+        return closed_ || expectedGeneration != generation_ || queue_.size() < capacity_;
+      });
+      if (closed_ || expectedGeneration != generation_) {
+        return QueuePushResult::Closed;
+      }
+    } else if (queue_.size() >= capacity_) {
+      if (overflowPolicy_ == OverflowPolicy::DropNewest) {
+        ++droppedCount_;
+        return QueuePushResult::DroppedNewest;
+      }
+
+      // DropOldest：移除最早的消息，再让新消息进入队列。
+      queue_.pop();
+      ++droppedCount_;
+      emplaceLocked(std::forward<U>(value));
+      lock.unlock();
+      notEmpty_.notify_one();
+      return QueuePushResult::DroppedOldest;
+    }
+
+    emplaceLocked(std::forward<U>(value));
+    lock.unlock();
+    notEmpty_.notify_one();
+    return QueuePushResult::Enqueued;
+  }
+
+  template <typename U>
+  void emplaceLocked(U&& value) {
+    queue_.emplace(std::forward<U>(value));
+    if (queue_.size() > highWaterMark_) {
+      highWaterMark_ = queue_.size();
+    }
+  }
+
+  mutable std::mutex mutex_;
+  std::condition_variable notEmpty_;
+  std::condition_variable notFull_;
+  std::queue<T> queue_;
+  std::size_t capacity_{std::numeric_limits<std::size_t>::max()};
+  std::size_t highWaterMark_{0};
+  std::size_t generation_{0};
+  std::uint64_t droppedCount_{0};
+  OverflowPolicy overflowPolicy_{OverflowPolicy::Block};
+  bool closed_{false};
 };
 
 #endif

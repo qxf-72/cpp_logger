@@ -2,79 +2,112 @@
 #define LOGGER_H
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
+#include <cstdint>
+#include <ctime>
+#include <filesystem>
 #include <fstream>
-#include <mutex>
+#include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #include "BlockingQueue.h"
 
 enum class LogLevel { DEBUG = 0, INFO, WARN, ERROR, FATAL };
 
+// 日志器初始化参数。每次成功 init() 都会重置队列峰值和溢出丢弃计数。
+struct LoggerConfig {
+  static constexpr std::size_t kDefaultMaxFileSize = 1024 * 1024;
+  static constexpr std::size_t kDefaultQueueCapacity = 8192;
+
+  std::filesystem::path basePath;
+  LogLevel minLevel{LogLevel::DEBUG};
+  std::size_t maxFileSize{kDefaultMaxFileSize};
+  std::size_t queueCapacity{kDefaultQueueCapacity};
+  OverflowPolicy overflowPolicy{OverflowPolicy::Block};
+};
+
 class Logger {
  public:
+  // 默认单个日志文件上限为 1 MiB。
+  static constexpr std::size_t kDefaultMaxFileSize = LoggerConfig::kDefaultMaxFileSize;
+  static constexpr std::size_t kDefaultQueueCapacity = LoggerConfig::kDefaultQueueCapacity;
+
   static Logger& instance();
 
-  // 初始化日志器。
-  // baseName 是日志文件名前缀，最终文件名形如 baseName_2026-06-25_0.log。
-  // maxFileSize 控制单个日志文件的最大字节数，到达上限后会递增 fileIndex_ 滚动到新文件。
-  bool init(const std::string& baseName, LogLevel minLevel = LogLevel::DEBUG,
-            std::size_t maxFileSize = 1 * 1024 * 1024);
+  // 使用完整配置初始化。queueCapacity 必须大于 0。
+  [[nodiscard]] bool init(const LoggerConfig& config);
 
-  void setLevel(LogLevel level);
-
-  // 供宏在构造日志内容之前做快速过滤，避免低等级日志仍执行字符串拼接等开销。
-  bool shouldLog(LogLevel level) const;
-
-  void log(LogLevel level, const char* file, int line, const std::string& message);
-
-  // 主动停止后台线程。
-  // stop 会关闭队列、等待剩余日志写入完成，并刷新/关闭当前日志文件。
+  // basePath 可包含目录，例如 "logs/app" 会生成 logs/app_日期_序号.log。
+  // 保留旧接口；队列使用默认容量和 Block 策略。
+  [[nodiscard]] bool init(const std::filesystem::path& basePath,
+                          LogLevel minLevel = LogLevel::DEBUG,
+                          std::size_t maxFileSize = kDefaultMaxFileSize);
+  void setLevel(LogLevel level) noexcept;
+  // 宏在构造消息前先调用此函数，避免被过滤的日志产生字符串拼接开销。
+  [[nodiscard]] bool shouldLog(LogLevel level) const;
+  void log(LogLevel level, const char* file, int line, std::string_view message);
   void stop();
+
+  // 以下统计均为当前初始化周期的数据；DropNewest 与 DropOldest 都计入 droppedCount。
+  [[nodiscard]] std::uint64_t droppedCount() const;
+  [[nodiscard]] std::size_t queueSize() const;
+  [[nodiscard]] std::size_t queuePeakSize() const;
 
   Logger(const Logger&) = delete;
   Logger& operator=(const Logger&) = delete;
 
  private:
+  // 业务线程只构造原始记录；字符串格式化延后至后台线程，缩短日志调用的临界路径。
+  struct LogRecord {
+    std::chrono::system_clock::time_point timestamp;
+    LogLevel level;
+    std::thread::id threadId;
+    std::string file;
+    int line;
+    std::string message;
+  };
+
+  static constexpr std::size_t kWriteBatchSize = 64;
+
   Logger() = default;
   ~Logger();
 
-  // 后台消费线程主循环：从阻塞队列取日志，处理文件滚动，并写入文件。
+  // 后台线程负责消费队列、处理滚动并写入文件。
   void workerLoop();
+  std::string formatMessage(const LogRecord& record);
 
-  std::string formatMessage(LogLevel level, const char* file, int line, const std::string& message);
+  static std::string_view levelToString(LogLevel level) noexcept;
+  std::string formatTime(std::chrono::system_clock::time_point timestamp);
+  static std::string currentDate();
 
-  std::string levelToString(LogLevel level) const;
-  std::string currentTime() const;
-
-  // 以下函数只在后台线程或初始化阶段使用，用来维护按日期和大小滚动的日志文件。
-  std::string currentDate() const;
-  std::string makeLogFileName() const;
-  std::size_t fileSize(const std::string& filename) const;
+  std::filesystem::path makeLogFileName() const;
+  static std::size_t fileSize(const std::filesystem::path& filename);
   void openNewLogFile();
-  void rollIfNeeded(const std::string& message);
+  void flushPending(std::string& pending);
+  void rollIfNeeded(std::string_view message, std::string& pending);
 
- private:
   std::ofstream out_;
-
-  BlockingQueue<std::string> queue_;
+  BlockingQueue<LogRecord> queue_;
   std::thread worker_;
 
-  std::mutex initMutex_;
-
+  // log() 短暂持共享锁获取当前队列代次；init()/stop() 持独占锁切换生命周期。
+  mutable std::shared_mutex lifecycleMutex_;
   std::atomic_int minLevel_{static_cast<int>(LogLevel::DEBUG)};
   std::atomic_bool running_{false};
 
-  std::string baseName_;  // 日志文件名前缀，例如传入 "app" 会生成 app_日期_序号.log。
-  std::string currentDate_;  // 当前打开文件对应的日期，日期变化时会切换到新一天的 0 号文件。
-  std::size_t currentSize_{0};  // 当前日志文件已经写入的字节数，用于判断是否需要按大小滚动。
-  std::size_t maxFileSize_{1 * 1024 * 1024};  // 单个日志文件允许写入的最大字节数。
-  int fileIndex_{0};  // 当天日志文件序号，文件超过大小上限后递增。
+  std::filesystem::path basePath_;
+  std::string currentDate_;
+  std::time_t cachedTimestampSecond_{};
+  std::string cachedTimestampPrefix_;
+  bool hasCachedTimestampPrefix_{false};
+  std::size_t currentSize_{0};
+  std::size_t maxFileSize_{kDefaultMaxFileSize};
+  int fileIndex_{0};
 };
 
-// 宏里先调用 shouldLog，再求值 msg。
-// 这样被过滤掉的日志不会触发字符串拼接、函数调用等额外开销。
 #define LOG_IMPL(level, msg)                          \
   do {                                                \
     auto& logger = Logger::instance();                \

@@ -1,4 +1,6 @@
 build/
+build-ninja/
+.gitignore
 .vscode/
 *.o
 *.out

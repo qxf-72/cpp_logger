@@ -1,27 +1,49 @@
 #include "Logger.h"
 
+#include <charconv>
 #include <chrono>
 #include <ctime>
-#include <iomanip>
+#include <functional>
 #include <iostream>
-#include <sstream>
 #include <stdexcept>
-#include <thread>
+#include <system_error>
 #include <utility>
+#include <vector>
 
 namespace {
-// 将 time_t 转成本地时间。
-// Windows 和 Linux 的线程安全时间转换函数名字不同，这里统一封装，避免业务代码里到处写条件编译。
+namespace fs = std::filesystem;
+
+// Windows 与 POSIX 的线程安全本地时间转换接口不同，统一封装在这里。
 std::tm toLocalTime(std::time_t value) {
-  std::tm tmTime{};
+  std::tm localTime{};
 #ifdef _WIN32
-  localtime_s(&tmTime, &value);
+  localtime_s(&localTime, &value);
 #else
-  localtime_r(&value, &tmTime);
+  localtime_r(&value, &localTime);
 #endif
-  return tmTime;
+  return localTime;
 }
-}  // 匿名命名空间
+
+bool isValidOverflowPolicy(OverflowPolicy policy) noexcept {
+  switch (policy) {
+    case OverflowPolicy::Block:
+    case OverflowPolicy::DropNewest:
+    case OverflowPolicy::DropOldest:
+      return true;
+  }
+  return false;
+}
+
+template <typename Integer>
+void appendInteger(std::string& destination, Integer value) {
+  char buffer[32];
+  const auto [end, error] = std::to_chars(buffer, buffer + sizeof(buffer), value);
+  if (error != std::errc{}) {
+    throw std::runtime_error("unable to format integer");
+  }
+  destination.append(buffer, end);
+}
+}  // namespace
 
 Logger& Logger::instance() {
   static Logger logger;
@@ -32,70 +54,105 @@ Logger::~Logger() {
   stop();
 }
 
-bool Logger::init(const std::string& baseName, LogLevel minlevel, std::size_t maxFileSize) {
-  std::lock_guard<std::mutex> lock(initMutex_);
-  if (running_.load()) {
-    return true;
-  }
+bool Logger::init(const fs::path& basePath, LogLevel minLevel, std::size_t maxFileSize) {
+  LoggerConfig config;
+  config.basePath = basePath;
+  config.minLevel = minLevel;
+  config.maxFileSize = maxFileSize;
+  return init(config);
+}
 
-  if (worker_.joinable()) {
-    // 上一次 stop 后线程对象可能仍处于 joinable 状态，重新初始化前必须先回收它。
-    worker_.join();
-  }
-
-  if (baseName.empty() || maxFileSize == 0) {
+bool Logger::init(const LoggerConfig& config) {
+  // 独占生命周期锁后，已有的 log() 调用会完成，新的调用会等待本次初始化结束。
+  std::unique_lock lock(lifecycleMutex_);
+  if (running_.load(std::memory_order_acquire) || config.basePath.empty() ||
+      config.maxFileSize == 0 || config.queueCapacity == 0 ||
+      !isValidOverflowPolicy(config.overflowPolicy)) {
     return false;
   }
 
-  // stop() 会关闭队列；如果允许再次 init，就必须把队列恢复到可写状态。
-  queue_.reset();
-  minLevel_.store(static_cast<int>(minlevel));
-  baseName_ = baseName;
-  maxFileSize_ = maxFileSize;
+  if (worker_.joinable()) {
+    worker_.join();
+  }
+
+  const fs::path parentPath = config.basePath.parent_path();
+  if (!parentPath.empty()) {
+    // 允许调用方直接使用尚未创建的日志目录。
+    std::error_code error;
+    fs::create_directories(parentPath, error);
+    if (error) {
+      std::cerr << "logger init failed: unable to create directory '" << parentPath.string()
+                << "': " << error.message() << '\n';
+      return false;
+    }
+  }
+
+  // stop() 会关闭队列；重新初始化前必须恢复其可写状态并应用新的容量和策略。
+  queue_.reset(config.queueCapacity, config.overflowPolicy);
+  minLevel_.store(static_cast<int>(config.minLevel), std::memory_order_release);
+  basePath_ = config.basePath;
+  maxFileSize_ = config.maxFileSize;
   currentDate_ = currentDate();
+  hasCachedTimestampPrefix_ = false;
+  cachedTimestampPrefix_.clear();
   currentSize_ = 0;
   fileIndex_ = 0;
 
   try {
     openNewLogFile();
-  } catch (const std::exception& e) {
-    // 文件打开失败时不要启动后台线程，否则后续日志会进入一个没有输出目标的 worker。
-    std::cerr << "logger init failed: " << e.what() << std::endl;
+    running_.store(true, std::memory_order_release);
+    worker_ = std::thread(&Logger::workerLoop, this);
+  } catch (const std::exception& error) {
+    running_.store(false, std::memory_order_release);
     queue_.close();
+    if (out_.is_open()) {
+      out_.close();
+    }
+    std::cerr << "logger init failed: " << error.what() << '\n';
     return false;
   }
-
-  running_.store(true);
-  worker_ = std::thread([this]() { workerLoop(); });
 
   return true;
 }
 
-void Logger::setLevel(LogLevel level) {
-  minLevel_ = static_cast<int>(level);
+void Logger::setLevel(LogLevel level) noexcept {
+  minLevel_.store(static_cast<int>(level), std::memory_order_release);
 }
 
 bool Logger::shouldLog(LogLevel level) const {
-  return running_.load() && static_cast<int>(level) >= minLevel_.load();
+  // 与 stop() 同步，保证返回 true 后的 log() 不会跨越一次停机操作入队。
+  std::shared_lock lock(lifecycleMutex_);
+  return running_.load(std::memory_order_acquire) &&
+         static_cast<int>(level) >= minLevel_.load(std::memory_order_acquire);
 }
 
-void Logger::log(LogLevel level, const char* file, int line, const std::string& message) {
-  // 防御性检查
-  if (!shouldLog(level)) {
-    return;
+void Logger::log(LogLevel level, const char* file, int line, std::string_view message) {
+  std::size_t queueGeneration = 0;
+  {
+    // Block 策略的入队可能等待较长时间，因此不能持有共享生命周期锁等待空位；
+    // 否则 stop() 无法取得独占锁并关闭队列来唤醒等待的生产者。
+    std::shared_lock lock(lifecycleMutex_);
+    if (!running_.load(std::memory_order_acquire) ||
+        static_cast<int>(level) < minLevel_.load(std::memory_order_acquire)) {
+      return;
+    }
+    queueGeneration = queue_.generation();
   }
 
-  std::string msg = formatMessage(level, file, line, message);
-  if (!queue_.push(std::move(msg))) {
-    running_.store(false);
+  // 重启后 generation 会改变；旧调用即使在 reset() 后才执行到这里，也会被队列拒绝。
+  // 时间和线程 ID 必须由生产者捕获，保证日志反映实际调用时刻；格式化留给后台线程完成。
+  LogRecord record{std::chrono::system_clock::now(), level, std::this_thread::get_id(),
+                   file == nullptr ? "" : file,      line,  std::string(message)};
+  const QueuePushResult result = queue_.push(queueGeneration, std::move(record));
+  if (result == QueuePushResult::Closed) {
+    return;
   }
 }
 
 void Logger::stop() {
-  std::lock_guard<std::mutex> lock(initMutex_);
-
-  // 先标记停止，再关闭队列唤醒 worker；worker 会继续写完队列里已经存在的日志。
-  running_.store(false);
+  // 关闭队列后，worker 仍会排空已经入队的日志，再由 join() 回收。
+  std::unique_lock lock(lifecycleMutex_);
+  running_.store(false, std::memory_order_release);
   queue_.close();
 
   if (worker_.joinable()) {
@@ -108,32 +165,44 @@ void Logger::stop() {
   }
 }
 
+std::uint64_t Logger::droppedCount() const {
+  return queue_.droppedCount();
+}
+
+std::size_t Logger::queueSize() const {
+  return queue_.size();
+}
+
+std::size_t Logger::queuePeakSize() const {
+  return queue_.peakSize();
+}
+
 void Logger::workerLoop() {
-  std::string message;
-  std::size_t writeCount = 0;
+  std::vector<LogRecord> batch;
+  batch.reserve(kWriteBatchSize);
+  std::string pending;
 
-  while (queue_.pop(message)) {
+  while (queue_.popBatch(batch, kWriteBatchSize)) {
     try {
-      // 每条日志写入前都检查是否需要按日期或文件大小切换输出文件。
-      rollIfNeeded(message);
+      for (const LogRecord& record : batch) {
+        const std::string message = formatMessage(record);
+        // 只有后台线程会修改文件状态，因此滚动逻辑不需要额外加锁。若需要滚动，
+        // rollIfNeeded 会先写入 pending，确保旧文件不会遗失本批已经格式化的内容。
+        rollIfNeeded(message, pending);
+        pending += message;
+        pending += '\n';
+        currentSize_ += message.size() + 1;
+      }
 
-      out_ << message << '\n';
+      // 每批只执行一次 stream::write() 和 flush()，减少逐条 ostream 输出的开销。
+      flushPending(pending);
+      out_.flush();
       if (!out_) {
-        throw std::runtime_error("write log fail.");
+        throw std::runtime_error("failed to flush log file");
       }
-
-      currentSize_ += message.size() + 1;
-
-      ++writeCount;
-      if (writeCount >= 64) {
-        // 批量刷新可以减少磁盘 flush 次数，同时避免长时间不落盘。
-        out_.flush();
-        writeCount = 0;
-      }
-    } catch (const std::exception& e) {
-      // 后台线程不能让异常逃逸，否则 std::thread 会触发 std::terminate 直接结束进程。
-      std::cerr << "logger worker failed: " << e.what() << std::endl;
-      running_.store(false);
+    } catch (const std::exception& error) {
+      std::cerr << "logger worker failed: " << error.what() << '\n';
+      running_.store(false, std::memory_order_release);
       queue_.close();
       break;
     }
@@ -141,23 +210,38 @@ void Logger::workerLoop() {
 
   if (out_.is_open()) {
     out_.flush();
+    if (!out_) {
+      std::cerr << "logger worker failed: unable to flush log file\n";
+      running_.store(false, std::memory_order_release);
+    }
   }
 }
 
-std::string Logger::formatMessage(LogLevel level, const char* file, int line,
-                                  const std::string& message) {
-  std::ostringstream oss;
+std::string Logger::formatMessage(const LogRecord& record) {
+  const std::string timestamp = formatTime(record.timestamp);
+  const std::string_view level = levelToString(record.level);
 
-  // 输出格式：[时间][级别][线程ID][源文件:行号] 日志正文。
-  oss << "[" << currentTime() << "]"
-      << "[" << levelToString(level) << "]"
-      << "[tid:" << std::this_thread::get_id() << "]"
-      << "[" << file << ":" << line << "] " << message;
-
-  return oss.str();
+  // 提前分配足够空间，避免拼接时间、线程 ID 和文件行号时反复扩容。
+  std::string formatted;
+  formatted.reserve(timestamp.size() + level.size() + record.file.size() + record.message.size() +
+                    64);
+  formatted.push_back('[');
+  formatted += timestamp;
+  formatted += "][";
+  formatted += level;
+  formatted += "][tid:";
+  // std::thread::id 没有数值转换接口，使用稳定的 hash 作为日志中的线程标识。
+  appendInteger(formatted, std::hash<std::thread::id>{}(record.threadId));
+  formatted += "][";
+  formatted += record.file;
+  formatted.push_back(':');
+  appendInteger(formatted, record.line);
+  formatted += "] ";
+  formatted += record.message;
+  return formatted;
 }
 
-std::string Logger::levelToString(LogLevel level) const {
+std::string_view Logger::levelToString(LogLevel level) noexcept {
   switch (level) {
     case LogLevel::DEBUG:
       return "DEBUG";
@@ -169,74 +253,72 @@ std::string Logger::levelToString(LogLevel level) const {
       return "ERROR";
     case LogLevel::FATAL:
       return "FATAL";
-    default:
-      return "UNKNOWN";
   }
+  return "UNKNOWN";
 }
 
-std::string Logger::currentTime() const {
-  // 精确到毫秒，方便排查并发场景下的日志先后顺序。
-  auto now = std::chrono::system_clock::now();
-  auto time = std::chrono::system_clock::to_time_t(now);
-  auto milliseconds =
-      std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+std::string Logger::formatTime(std::chrono::system_clock::time_point timestamp) {
+  const auto time = std::chrono::system_clock::to_time_t(timestamp);
+  if (!hasCachedTimestampPrefix_ || time != cachedTimestampSecond_) {
+    const std::tm localTime = toLocalTime(time);
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &localTime);
+    cachedTimestampPrefix_ = buffer;
+    cachedTimestampSecond_ = time;
+    hasCachedTimestampPrefix_ = true;
+  }
 
-  std::tm tmTime = toLocalTime(time);
-  char buffer[32];
-  std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &tmTime);
-
-  std::ostringstream oss;
-  oss << buffer << "." << std::setw(3) << std::setfill('0') << milliseconds.count();
-
-  return oss.str();
+  const auto milliseconds =
+      std::chrono::duration_cast<std::chrono::milliseconds>(timestamp.time_since_epoch()) % 1000;
+  std::string formatted = cachedTimestampPrefix_;
+  formatted.push_back('.');
+  if (milliseconds.count() < 100) {
+    formatted.push_back('0');
+  }
+  if (milliseconds.count() < 10) {
+    formatted.push_back('0');
+  }
+  appendInteger(formatted, milliseconds.count());
+  return formatted;
 }
 
-std::string Logger::currentDate() const {
-  auto now = std::chrono::system_clock::now();
-  auto time = std::chrono::system_clock::to_time_t(now);
-  std::tm tmTime = toLocalTime(time);
+std::string Logger::currentDate() {
+  const auto time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+  const std::tm localTime = toLocalTime(time);
 
-  char buffer[32];
-  std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", &tmTime);
-
+  char buffer[16];
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", &localTime);
   return buffer;
 }
 
-std::string Logger::makeLogFileName() const {
-  std::ostringstream oss;
-  oss << baseName_ << '_' << currentDate_ << '_' << fileIndex_ << ".log";
-  return oss.str();
+fs::path Logger::makeLogFileName() const {
+  // 保留 basePath 的父目录，只对最后的文件名前缀追加日期和序号。
+  const std::string filename = basePath_.filename().string() + '_' + currentDate_ + '_' +
+                               std::to_string(fileIndex_) + ".log";
+  return basePath_.parent_path() / filename;
 }
 
-std::size_t Logger::fileSize(const std::string& filename) const {
-  // 以 ate 方式打开后读 tellg，可以得到已有日志文件的字节数。
-  // 如果文件不存在，说明这是新文件，大小按 0 处理。
-  std::ifstream in(filename.c_str(), std::ios::binary | std::ios::ate);
-  if (!in.is_open()) {
-    return 0;
-  }
-
-  std::ifstream::pos_type pos = in.tellg();
-  if (pos == std::ifstream::pos_type(-1)) {
-    return 0;
-  }
-
-  return static_cast<std::size_t>(pos);
+std::size_t Logger::fileSize(const fs::path& filename) {
+  // 文件不存在时 file_size 会通过 error_code 返回错误，此处按新文件的大小 0 处理。
+  std::error_code error;
+  const auto size = fs::file_size(filename, error);
+  return error ? 0 : static_cast<std::size_t>(size);
 }
 
 void Logger::openNewLogFile() {
-  const std::string filename = makeLogFileName();
+  const fs::path filename = makeLogFileName();
   const std::size_t existingSize = fileSize(filename);
-
-  // 先打开新文件，成功后再替换当前 out_。
-  // 这样滚动失败时不会提前关闭旧文件，避免日志输出目标丢失。
-  std::ofstream next(filename.c_str(), std::ios::out | std::ios::app);
+  std::ofstream next(filename, std::ios::out | std::ios::app);
   if (!next.is_open()) {
-    throw std::runtime_error("open file fail: " + filename);
+    throw std::runtime_error("unable to open log file: " + filename.string());
   }
 
   if (out_.is_open()) {
+    // 新文件已成功打开后才关闭旧文件，避免滚动失败时失去当前输出目标。
     out_.flush();
+    if (!out_) {
+      throw std::runtime_error("unable to flush current log file");
+    }
     out_.close();
   }
 
@@ -244,20 +326,32 @@ void Logger::openNewLogFile() {
   currentSize_ = existingSize;
 }
 
-void Logger::rollIfNeeded(const std::string& message) {
-  std::string today = currentDate();
+void Logger::flushPending(std::string& pending) {
+  if (pending.empty()) {
+    return;
+  }
 
+  out_.write(pending.data(), static_cast<std::streamsize>(pending.size()));
+  if (!out_) {
+    throw std::runtime_error("failed to write log batch");
+  }
+  pending.clear();
+}
+
+void Logger::rollIfNeeded(std::string_view message, std::string& pending) {
+  const std::string today = currentDate();
   if (today != currentDate_) {
-    // 日期变化时从新日期的 0 号文件重新开始写。
+    // 日期变更时从新日期的 0 号文件重新开始。
+    flushPending(pending);
     currentDate_ = today;
     fileIndex_ = 0;
     openNewLogFile();
   }
 
   const std::size_t appendSize = message.size() + 1;
-  // 当前文件已有内容且追加后会超过上限时，继续寻找下一个可写文件。
-  // 如果单条日志本身就超过上限，则允许它写入空文件，避免陷入无限滚动。
+  // 单条超大日志允许写入空文件，避免反复滚动却无法写入。
   while (currentSize_ > 0 && currentSize_ + appendSize > maxFileSize_) {
+    flushPending(pending);
     ++fileIndex_;
     openNewLogFile();
   }
