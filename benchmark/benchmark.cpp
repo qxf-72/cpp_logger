@@ -27,6 +27,10 @@ struct BenchmarkOptions {
   std::size_t messagesPerThread{50000};
   std::size_t payloadSize{128};
   std::size_t runs{3};
+  std::size_t writeBatchSize{LoggerConfig::kDefaultWriteBatchSize};
+  FlushPolicy flushPolicy{FlushPolicy::Periodic};
+  std::size_t flushIntervalMilliseconds{
+      static_cast<std::size_t>(LoggerConfig::kDefaultFlushInterval.count())};
   fs::path outputDirectory{"benchmark_logs"};
   bool keepLogs{false};
 };
@@ -44,9 +48,37 @@ void printUsage(const char* program) {
             << "  --messages <N>   Messages per producer (default: 50000)\n"
             << "  --payload <N>    Message payload size in bytes (default: 128)\n"
             << "  --runs <N>       Number of repeated runs (default: 3)\n"
+            << "  --batch-size <N> Log records per writer batch (default: 256)\n"
+            << "  --flush-policy <on-stop|periodic|every-batch> (default: periodic)\n"
+            << "  --flush-interval-ms <N> Periodic flush interval in milliseconds (default: 1000)\n"
             << "  --output <PATH>  Directory for temporary log files (default: benchmark_logs)\n"
             << "  --keep-logs      Keep the log files after each run\n"
             << "  --help           Show this help message\n";
+}
+
+FlushPolicy parseFlushPolicy(std::string_view value) {
+  if (value == "on-stop") {
+    return FlushPolicy::OnStop;
+  }
+  if (value == "periodic") {
+    return FlushPolicy::Periodic;
+  }
+  if (value == "every-batch") {
+    return FlushPolicy::EveryBatch;
+  }
+  throw std::invalid_argument("invalid flush policy: " + std::string(value));
+}
+
+std::string_view flushPolicyName(FlushPolicy policy) {
+  switch (policy) {
+    case FlushPolicy::OnStop:
+      return "on-stop";
+    case FlushPolicy::Periodic:
+      return "periodic";
+    case FlushPolicy::EveryBatch:
+      return "every-batch";
+  }
+  return "unknown";
 }
 
 // 使用 from_chars 避免命令行参数解析依赖区域设置或抛出转换异常。
@@ -87,6 +119,12 @@ BenchmarkOptions parseOptions(int argc, char* argv[]) {
       options.payloadSize = parsePositiveSize(value, argument);
     } else if (argument == "--runs") {
       options.runs = parsePositiveSize(value, argument);
+    } else if (argument == "--batch-size") {
+      options.writeBatchSize = parsePositiveSize(value, argument);
+    } else if (argument == "--flush-policy") {
+      options.flushPolicy = parseFlushPolicy(value);
+    } else if (argument == "--flush-interval-ms") {
+      options.flushIntervalMilliseconds = parsePositiveSize(value, argument);
     } else if (argument == "--output") {
       options.outputDirectory = std::string(value);
     } else {
@@ -97,6 +135,10 @@ BenchmarkOptions parseOptions(int argc, char* argv[]) {
   // 防止后续计算总日志数时发生整数溢出。
   if (options.threadCount > std::numeric_limits<std::size_t>::max() / options.messagesPerThread) {
     throw std::invalid_argument("threads multiplied by messages is too large");
+  }
+  if (options.flushIntervalMilliseconds >
+      static_cast<std::size_t>(std::numeric_limits<std::chrono::milliseconds::rep>::max())) {
+    throw std::invalid_argument("flush interval is too large");
   }
   return options;
 }
@@ -124,7 +166,15 @@ BenchmarkResult runOnce(const BenchmarkOptions& options, std::size_t runIndex) {
   const fs::path logBasePath = runDirectory / "app";
   // 取一个实际不可达到的上限，避免文件滚动干扰基础吞吐量测试。
   const std::size_t maxFileSize = std::numeric_limits<std::size_t>::max() / 2;
-  if (!Logger::instance().init(logBasePath, LogLevel::INFO, maxFileSize)) {
+  LoggerConfig loggerConfig;
+  loggerConfig.basePath = logBasePath;
+  loggerConfig.minLevel = LogLevel::INFO;
+  loggerConfig.maxFileSize = maxFileSize;
+  loggerConfig.writeBatchSize = options.writeBatchSize;
+  loggerConfig.flushPolicy = options.flushPolicy;
+  loggerConfig.flushInterval = std::chrono::milliseconds(
+      static_cast<std::chrono::milliseconds::rep>(options.flushIntervalMilliseconds));
+  if (!Logger::instance().init(loggerConfig)) {
     throw std::runtime_error("unable to initialize logger");
   }
 
@@ -211,7 +261,8 @@ void printResult(std::string_view label, const BenchmarkOptions& options,
 
   // 使用 CSV，便于直接导入电子表格或交给脚本做多组参数对比。
   std::cout << label << ',' << options.threadCount << ',' << options.messagesPerThread << ','
-            << options.payloadSize << ',' << totalMessages << ',' << std::fixed
+            << options.payloadSize << ',' << options.writeBatchSize << ','
+            << flushPolicyName(options.flushPolicy) << ',' << totalMessages << ',' << std::fixed
             << std::setprecision(6) << result.producerSeconds << ',' << result.totalSeconds << ','
             << std::setprecision(2) << producerRate << ',' << totalRate << '\n';
 }
@@ -220,8 +271,9 @@ void printResult(std::string_view label, const BenchmarkOptions& options,
 int main(int argc, char* argv[]) {
   try {
     const BenchmarkOptions options = parseOptions(argc, argv);
-    std::cout << "run,threads,messages_per_thread,payload_bytes,total_messages,producer_seconds,"
-                 "end_to_end_seconds,producer_logs_per_second,end_to_end_logs_per_second\n";
+    std::cout << "run,threads,messages_per_thread,payload_bytes,batch_size,flush_policy,"
+                 "total_messages,producer_seconds,end_to_end_seconds,producer_logs_per_second,"
+                 "end_to_end_logs_per_second\n";
 
     // 每轮单独输出，并在末尾输出平均结果。
     BenchmarkResult total;

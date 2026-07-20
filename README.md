@@ -9,7 +9,7 @@
 业务线程只采集原始日志记录并写入 `BlockingQueue`；后台线程批量格式化、批量落盘，从而缩短业务线程的日志调用路径。
 
 ![C++](https://img.shields.io/badge/C%2B%2B-17-blue.svg)
-![CMake](https://img.shields.io/badge/CMake-3.10%2B-brightgreen.svg)
+![CMake](https://img.shields.io/badge/CMake-3.14%2B-brightgreen.svg)
 ![GitHub top language](https://img.shields.io/github/languages/top/qxf-72/cpp_logger)
 ![Platform](https://img.shields.io/badge/Platform-Cross%20platform-brightgreen.svg)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
@@ -62,7 +62,7 @@ cpp_logger/
 
 - Windows、Linux 或 macOS
 - C++17 或更高版本
-- CMake 3.10 或更高版本
+- CMake 3.14 或更高版本
 - GCC、Clang 或 MSVC
 
 ### 构建项目
@@ -123,6 +123,7 @@ tail -n 20 logs/app_*.log
 ## 📖 使用示例
 
 ```cpp
+#include <chrono>
 #include <iostream>
 
 #include "Logger.h"
@@ -134,6 +135,10 @@ int main() {
   config.maxFileSize = 10 * 1024 * 1024;
   config.queueCapacity = 8192;
   config.overflowPolicy = OverflowPolicy::DropNewest;
+  config.writeBatchSize = 256;
+  config.flushPolicy = FlushPolicy::Periodic;
+  config.flushInterval = std::chrono::seconds(1);
+  config.flushAtOrAbove = LogLevel::ERROR;
 
   if (!Logger::instance().init(config)) {
     return 1;
@@ -151,7 +156,7 @@ int main() {
 }
 ```
 
-旧的 `init("app", LogLevel::DEBUG, 10 * 1024 * 1024)` 接口仍可用，它会使用默认容量 `8192` 和 `Block` 策略。
+旧的 `init("app", LogLevel::DEBUG, 10 * 1024 * 1024)` 接口仍可用，它会使用默认容量 `8192`、`Block` 策略、256 条批次和定时刷新。
 
 ## 🧱 有界队列与满队列策略
 
@@ -164,6 +169,18 @@ int main() {
 | `OverflowPolicy::DropOldest` | 丢弃队列中最早的日志，保留本次新日志 | 排障时更关注最新状态 |
 
 `droppedCount()` 会统计两种丢弃策略造成的日志丢失；`queueSize()` 返回当前待写条数；`queuePeakSize()` 返回本次初始化以来的队列峰值。每次成功 `init()` 会重置这三项统计。
+
+## 💾 刷新与批处理策略
+
+`writeBatchSize` 控制一次最多格式化并写入多少条日志，默认值为 `256`。`flushPolicy` 控制何时将 C++ 流缓冲刷新到操作系统缓存：
+
+| 策略 | 行为 | 适用场景 |
+| --- | --- | --- |
+| `FlushPolicy::OnStop` | 仅在 `stop()` 时刷新；`flushAtOrAbove` 触发的记录除外 | 追求最高吞吐，并能确保显式正常停机 |
+| `FlushPolicy::Periodic` | 按 `flushInterval` 刷新（默认 1 秒），并在处理到 `flushAtOrAbove` 的记录后刷新 | 吞吐量与可观测性的默认平衡 |
+| `FlushPolicy::EveryBatch` | 每个写入批次后刷新 | 更低可见延迟，代价是更高开销 |
+
+`flushAtOrAbove` 默认是 `LogLevel::ERROR`；设置为 `std::nullopt` 可关闭按级别刷新。按级别刷新发生在后台线程处理到该记录后，因此不会让生产者调用变成同步操作。`std::ofstream::flush()` 不等于 `fsync`，不提供断电安全的持久化保证。
 
 ## 📝 日志格式
 
@@ -248,10 +265,10 @@ cmake --build build
 
 ```bash
 # Ninja、Unix Makefiles 等单配置生成器
-./build/logger_benchmark --threads 4 --messages 50000 --payload 128 --runs 3
+./build/logger_benchmark --threads 4 --messages 50000 --payload 128 --runs 5
 
 # Visual Studio 等多配置生成器
-./build/Release/logger_benchmark --threads 4 --messages 50000 --payload 128 --runs 3
+./build/Release/logger_benchmark --threads 4 --messages 50000 --payload 128 --runs 5
 ```
 
 常用参数：
@@ -265,22 +282,30 @@ cmake --build build
 --keep-logs      保留每轮生成的日志文件
 ```
 
-输出为 CSV。`producer_logs_per_second` 只统计业务线程提交日志的速度；`end_to_end_logs_per_second` 还包含 `stop()` 排空队列和刷新文件的时间。默认会在每轮结束后删除临时日志，避免压测占满磁盘。
+输出为 CSV。`producer_logs_per_second` 只统计业务线程提交日志的速度；`end_to_end_logs_per_second` 还包含 `stop()` 排空队列和刷新文件的时间。`--batch-size`、`--flush-policy` 和 `--flush-interval-ms` 可控制写入端配置。默认会在每轮结束后删除临时日志，避免压测占满磁盘。
 
-### 测试结果
+### cpp_logger 与 spdlog 对比
 
-以下数据来自默认命令 `./build/logger_benchmark --threads 4 --messages 50000 --payload 128 --runs 3`。每轮由 4 个生产者线程各写入 50,000 条日志，共 200,000 条；日志正文为 128 B，文件滚动被关闭。
+对照目标默认关闭，因此普通构建不会下载依赖。它会优先查找已安装的 spdlog；如果本机没有，可追加 `-DLOGGER_FETCH_SPDLOG=ON`，在构建目录中获取固定的 v1.17.0。
 
-本次压测使用旧版 `init(...)` 接口的默认配置：容量为 `8192` 的有界队列和 `Block` 策略。因此生产者吞吐量包含队列满时的背压等待，反映“不丢日志”的实际代价；只能与相同队列配置下的结果比较。
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+  -DLOGGER_BUILD_SPDLOG_BENCHMARK=ON -DLOGGER_FETCH_SPDLOG=ON
+cmake --build build --config Release
 
-| 指标 | 平均结果 |
-| --- | ---: |
-| 生产者耗时 | 340.929 ms |
-| 端到端耗时 | 354.980 ms |
-| 生产者吞吐量 | 586,633 条/秒 |
-| 端到端吞吐量 | 563,413 条/秒 |
+./build/logger_spdlog_benchmark --threads 4 --messages 250000 --payload 128 --runs 3
+```
 
-测试环境：Windows 10 Pro 64 位（10.0.19045）、AMD Ryzen 7 5800H（8 核 16 线程）、约 13.9 GiB 可见内存、Clang 21.1.8、Ninja Release 构建。相较于引入后台格式化和批量写入前的同配置基线，生产者与端到端吞吐量分别提升约 23% 和 21%。结果会受 CPU、磁盘、文件系统缓存和系统负载影响，仅用于同一环境下的版本比较。
+该程序会输出四种预定义模式的 Markdown 表格。两个 Block 模式均使用 1 个异步写线程、相同的 8192 条队列容量、相同的日志正文和源位置格式，以及每秒定时刷新；因此 `spdlog 对照` 是平衡模式的控制组。生产者吞吐量统计所有提交尝试，端到端吞吐量只统计成功接收的记录，所以 DropNewest 模式不会用很高的提交速度掩盖日志丢失。
+
+| 模式 | 队列策略 | 刷新策略 | 生产者吞吐量 | 端到端吞吐量 | 丢弃率 |
+| --- | --- | --- | ---: | ---: | ---: |
+| 可靠模式（`cpp_logger`） | Block | EveryBatch | 686,509 条/秒 | 679,626 条/秒 | 0.0000% |
+| 平衡模式（`cpp_logger`） | Block | Periodic 1 s | 675,741 条/秒 | 669,458 条/秒 | 0.0000% |
+| 生产者低延迟（`cpp_logger`） | DropNewest | Periodic 1 s | 6,126,948 条/秒 | 778,154 条/秒 | 86.4329% |
+| spdlog 对照（v1.17.0） | Block | Periodic 1 s | 581,949 条/秒 | 579,614 条/秒 | 0.0000% |
+
+上表来自同一台机器、同一 Release 构建：4 个生产者线程、每线程 250,000 条、128 B 正文、每个模式重复 3 轮。结果会受 CPU、存储、文件系统缓存、编译器和系统负载影响；请在同一台机器上使用上述命令比较版本。
 
 `std::ofstream::flush()` 会刷新 C++ 流和操作系统缓存，但不等同于物理磁盘 `fsync`；因此端到端指标表示日志库完成排空和刷新，而非断电安全的持久化延迟。
 

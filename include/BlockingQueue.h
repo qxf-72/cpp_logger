@@ -1,6 +1,7 @@
 #ifndef BLOCKING_QUEUE_H
 #define BLOCKING_QUEUE_H
 
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -60,29 +61,19 @@ class BlockingQueue {
   // 一次取出至多 maxCount 个元素，减少消费者频繁加锁和上下文切换的开销。
   // 队列关闭且已排空时返回 false。
   [[nodiscard]] bool popBatch(std::vector<T>& values, std::size_t maxCount) {
-    values.clear();
-    if (maxCount == 0) {
-      return false;
-    }
+    return popBatchImpl(values, maxCount, [this](std::unique_lock<std::mutex>& lock) {
+      notEmpty_.wait(lock, [this] { return closed_ || !queue_.empty(); });
+      return true;
+    });
+  }
 
-    std::unique_lock lock(mutex_);
-    notEmpty_.wait(lock, [this] { return closed_ || !queue_.empty(); });
-
-    if (queue_.empty()) {
-      return false;
-    }
-
-    if (values.capacity() < maxCount) {
-      values.reserve(maxCount);
-    }
-    for (std::size_t index = 0; index < maxCount && !queue_.empty(); ++index) {
-      values.emplace_back(std::move(queue_.front()));
-      queue_.pop();
-    }
-    lock.unlock();
-    // 可能一次释放了多个空位，唤醒所有等待的 Block 生产者。
-    notFull_.notify_all();
-    return true;
+  // 最多等待 timeout 后返回，供需要定时执行维护工作的消费者使用。
+  template <typename Rep, typename Period>
+  [[nodiscard]] bool popBatchFor(std::vector<T>& values, std::size_t maxCount,
+                                 const std::chrono::duration<Rep, Period>& timeout) {
+    return popBatchImpl(values, maxCount, [this, &timeout](std::unique_lock<std::mutex>& lock) {
+      return notEmpty_.wait_for(lock, timeout, [this] { return closed_ || !queue_.empty(); });
+    });
   }
 
   // 唤醒消费者与因队列已满而阻塞的生产者。
@@ -156,6 +147,35 @@ class BlockingQueue {
   }
 
  private:
+  template <typename WaitFunction>
+  [[nodiscard]] bool popBatchImpl(std::vector<T>& values, std::size_t maxCount,
+                                  WaitFunction&& waitForData) {
+    values.clear();
+    if (maxCount == 0) {
+      return false;
+    }
+
+    std::unique_lock lock(mutex_);
+    if (!waitForData(lock)) {
+      return false;
+    }
+
+    if (queue_.empty()) {
+      return false;
+    }
+
+    if (values.capacity() < maxCount) {
+      values.reserve(maxCount);
+    }
+    for (std::size_t index = 0; index < maxCount && !queue_.empty(); ++index) {
+      values.emplace_back(std::move(queue_.front()));
+      queue_.pop();
+    }
+    lock.unlock();
+    // 可能一次释放了多个空位，唤醒所有等待的 Block 生产者。
+    notFull_.notify_all();
+    return true;
+  }
   template <typename U>
   QueuePushResult pushLocked(std::unique_lock<std::mutex>& lock, std::size_t expectedGeneration,
                              U&& value) {

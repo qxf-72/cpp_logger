@@ -5,6 +5,7 @@
 #include <ctime>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <system_error>
 #include <utility>
@@ -29,6 +30,28 @@ bool isValidOverflowPolicy(OverflowPolicy policy) noexcept {
     case OverflowPolicy::Block:
     case OverflowPolicy::DropNewest:
     case OverflowPolicy::DropOldest:
+      return true;
+  }
+  return false;
+}
+
+bool isValidLogLevel(LogLevel level) noexcept {
+  switch (level) {
+    case LogLevel::DEBUG:
+    case LogLevel::INFO:
+    case LogLevel::WARN:
+    case LogLevel::ERROR:
+    case LogLevel::FATAL:
+      return true;
+  }
+  return false;
+}
+
+bool isValidFlushPolicy(FlushPolicy policy) noexcept {
+  switch (policy) {
+    case FlushPolicy::OnStop:
+    case FlushPolicy::Periodic:
+    case FlushPolicy::EveryBatch:
       return true;
   }
   return false;
@@ -66,8 +89,11 @@ bool Logger::init(const LoggerConfig& config) {
   // 独占生命周期锁后，已有的 log() 调用会完成，新的调用会等待本次初始化结束。
   std::unique_lock lock(lifecycleMutex_);
   if (running_.load(std::memory_order_acquire) || config.basePath.empty() ||
-      config.maxFileSize == 0 || config.queueCapacity == 0 ||
-      !isValidOverflowPolicy(config.overflowPolicy)) {
+      config.maxFileSize == 0 || config.queueCapacity == 0 || config.writeBatchSize == 0 ||
+      !isValidLogLevel(config.minLevel) || !isValidOverflowPolicy(config.overflowPolicy) ||
+      !isValidFlushPolicy(config.flushPolicy) ||
+      (config.flushPolicy == FlushPolicy::Periodic && config.flushInterval.count() <= 0) ||
+      (config.flushAtOrAbove.has_value() && !isValidLogLevel(*config.flushAtOrAbove))) {
     return false;
   }
 
@@ -92,6 +118,10 @@ bool Logger::init(const LoggerConfig& config) {
   minLevel_.store(static_cast<int>(config.minLevel), std::memory_order_release);
   basePath_ = config.basePath;
   maxFileSize_ = config.maxFileSize;
+  writeBatchSize_ = config.writeBatchSize;
+  flushPolicy_ = config.flushPolicy;
+  flushInterval_ = config.flushInterval;
+  flushAtOrAbove_ = config.flushAtOrAbove;
   currentDate_ = currentDate();
   hasCachedTimestampPrefix_ = false;
   cachedTimestampPrefix_.clear();
@@ -120,13 +150,22 @@ void Logger::setLevel(LogLevel level) noexcept {
 }
 
 bool Logger::shouldLog(LogLevel level) const {
-  // 与 stop() 同步，保证返回 true 后的 log() 不会跨越一次停机操作入队。
-  std::shared_lock lock(lifecycleMutex_);
+  // log() 会在入队前以生命周期锁和队列代次复核。这里仅作为宏的无锁快筛，
+  // 避免通常路径为同一条日志获取两次共享锁。
   return running_.load(std::memory_order_acquire) &&
          static_cast<int>(level) >= minLevel_.load(std::memory_order_acquire);
 }
 
 void Logger::log(LogLevel level, const char* file, int line, std::string_view message) {
+  logImpl(level, file, line, message, false);
+}
+
+void Logger::logStatic(LogLevel level, const char* file, int line, std::string_view message) {
+  logImpl(level, file, line, message, true);
+}
+
+void Logger::logImpl(LogLevel level, const char* file, int line, std::string_view message,
+                     bool fileHasStaticStorage) {
   std::size_t queueGeneration = 0;
   {
     // Block 策略的入队可能等待较长时间，因此不能持有共享生命周期锁等待空位；
@@ -141,12 +180,14 @@ void Logger::log(LogLevel level, const char* file, int line, std::string_view me
 
   // 重启后 generation 会改变；旧调用即使在 reset() 后才执行到这里，也会被队列拒绝。
   // 时间和线程 ID 必须由生产者捕获，保证日志反映实际调用时刻；格式化留给后台线程完成。
-  LogRecord record{std::chrono::system_clock::now(), level, std::this_thread::get_id(),
-                   file == nullptr ? "" : file,      line,  std::string(message)};
-  const QueuePushResult result = queue_.push(queueGeneration, std::move(record));
-  if (result == QueuePushResult::Closed) {
-    return;
-  }
+  LogRecord record{std::chrono::system_clock::now(),
+                   level,
+                   std::this_thread::get_id(),
+                   fileHasStaticStorage ? (file == nullptr ? "" : file) : nullptr,
+                   fileHasStaticStorage ? std::string{} : std::string(file == nullptr ? "" : file),
+                   line,
+                   std::string(message)};
+  static_cast<void>(queue_.push(queueGeneration, std::move(record)));
 }
 
 void Logger::stop() {
@@ -178,12 +219,43 @@ std::size_t Logger::queuePeakSize() const {
 }
 
 void Logger::workerLoop() {
-  std::vector<LogRecord> batch;
-  batch.reserve(kWriteBatchSize);
-  std::string pending;
+  try {
+    std::vector<LogRecord> batch;
+    batch.reserve(writeBatchSize_);
+    std::string pending;
+    constexpr std::size_t kEstimatedFormattedRecordSize = 256;
+    if (writeBatchSize_ <=
+        std::numeric_limits<std::size_t>::max() / kEstimatedFormattedRecordSize) {
+      pending.reserve(writeBatchSize_ * kEstimatedFormattedRecordSize);
+    }
+    auto nextFlush = std::chrono::steady_clock::now() + flushInterval_;
 
-  while (queue_.popBatch(batch, kWriteBatchSize)) {
-    try {
+    while (true) {
+      bool hasBatch = false;
+      if (flushPolicy_ == FlushPolicy::Periodic) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto timeout =
+            now >= nextFlush
+                ? std::chrono::milliseconds::zero()
+                : std::chrono::duration_cast<std::chrono::milliseconds>(nextFlush - now);
+        hasBatch = queue_.popBatchFor(batch, writeBatchSize_, timeout);
+      } else {
+        hasBatch = queue_.popBatch(batch, writeBatchSize_);
+      }
+
+      if (!hasBatch) {
+        if (flushPolicy_ == FlushPolicy::Periodic &&
+            std::chrono::steady_clock::now() >= nextFlush) {
+          flushOutput();
+          nextFlush = std::chrono::steady_clock::now() + flushInterval_;
+        }
+        if (queue_.closed()) {
+          break;
+        }
+        continue;
+      }
+
+      bool flushForLevel = false;
       for (const LogRecord& record : batch) {
         const std::string message = formatMessage(record);
         // 只有后台线程会修改文件状态，因此滚动逻辑不需要额外加锁。若需要滚动，
@@ -192,20 +264,26 @@ void Logger::workerLoop() {
         pending += message;
         pending += '\n';
         currentSize_ += message.size() + 1;
+        flushForLevel =
+            flushForLevel || (flushAtOrAbove_.has_value() &&
+                              static_cast<int>(record.level) >= static_cast<int>(*flushAtOrAbove_));
       }
 
-      // 每批只执行一次 stream::write() 和 flush()，减少逐条 ostream 输出的开销。
+      // 每批只执行一次 stream::write()；flush 的时机由策略控制。
       flushPending(pending);
-      out_.flush();
-      if (!out_) {
-        throw std::runtime_error("failed to flush log file");
+      const bool periodicFlush =
+          flushPolicy_ == FlushPolicy::Periodic && std::chrono::steady_clock::now() >= nextFlush;
+      if (flushPolicy_ == FlushPolicy::EveryBatch || flushForLevel || periodicFlush) {
+        flushOutput();
+        if (flushPolicy_ == FlushPolicy::Periodic) {
+          nextFlush = std::chrono::steady_clock::now() + flushInterval_;
+        }
       }
-    } catch (const std::exception& error) {
-      std::cerr << "logger worker failed: " << error.what() << '\n';
-      running_.store(false, std::memory_order_release);
-      queue_.close();
-      break;
     }
+  } catch (const std::exception& error) {
+    std::cerr << "logger worker failed: " << error.what() << '\n';
+    running_.store(false, std::memory_order_release);
+    queue_.close();
   }
 
   if (out_.is_open()) {
@@ -220,11 +298,12 @@ void Logger::workerLoop() {
 std::string Logger::formatMessage(const LogRecord& record) {
   const std::string timestamp = formatTime(record.timestamp);
   const std::string_view level = levelToString(record.level);
+  const std::string_view file = record.staticFile == nullptr ? std::string_view(record.ownedFile)
+                                                             : std::string_view(record.staticFile);
 
   // 提前分配足够空间，避免拼接时间、线程 ID 和文件行号时反复扩容。
   std::string formatted;
-  formatted.reserve(timestamp.size() + level.size() + record.file.size() + record.message.size() +
-                    64);
+  formatted.reserve(timestamp.size() + level.size() + file.size() + record.message.size() + 64);
   formatted.push_back('[');
   formatted += timestamp;
   formatted += "][";
@@ -233,7 +312,7 @@ std::string Logger::formatMessage(const LogRecord& record) {
   // std::thread::id 没有数值转换接口，使用稳定的 hash 作为日志中的线程标识。
   appendInteger(formatted, std::hash<std::thread::id>{}(record.threadId));
   formatted += "][";
-  formatted += record.file;
+  formatted += file;
   formatted.push_back(':');
   appendInteger(formatted, record.line);
   formatted += "] ";
@@ -308,7 +387,8 @@ std::size_t Logger::fileSize(const fs::path& filename) {
 void Logger::openNewLogFile() {
   const fs::path filename = makeLogFileName();
   const std::size_t existingSize = fileSize(filename);
-  std::ofstream next(filename, std::ios::out | std::ios::app);
+  // 二进制模式保证 '\n' 始终只占一个字节，让 currentSize_ 与文件实际大小一致。
+  std::ofstream next(filename, std::ios::out | std::ios::app | std::ios::binary);
   if (!next.is_open()) {
     throw std::runtime_error("unable to open log file: " + filename.string());
   }
@@ -338,6 +418,13 @@ void Logger::flushPending(std::string& pending) {
   pending.clear();
 }
 
+void Logger::flushOutput() {
+  out_.flush();
+  if (!out_) {
+    throw std::runtime_error("failed to flush log file");
+  }
+}
+
 void Logger::rollIfNeeded(std::string_view message, std::string& pending) {
   const std::string today = currentDate();
   if (today != currentDate_) {
@@ -350,7 +437,8 @@ void Logger::rollIfNeeded(std::string_view message, std::string& pending) {
 
   const std::size_t appendSize = message.size() + 1;
   // 单条超大日志允许写入空文件，避免反复滚动却无法写入。
-  while (currentSize_ > 0 && currentSize_ + appendSize > maxFileSize_) {
+  while (currentSize_ > 0 &&
+         (appendSize > maxFileSize_ || currentSize_ > maxFileSize_ - appendSize)) {
     flushPending(pending);
     ++fileIndex_;
     openNewLogFile();

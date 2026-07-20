@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.14)
 
 project(cpp_logger LANGUAGES CXX)
 
@@ -39,6 +39,8 @@ target_link_libraries(logger_demo PRIVATE
 )
 
 option(LOGGER_BUILD_BENCHMARK "Build the logger performance benchmark" ON)
+option(LOGGER_BUILD_SPDLOG_BENCHMARK "Build the cpp_logger versus spdlog benchmark" OFF)
+option(LOGGER_FETCH_SPDLOG "Fetch the pinned spdlog dependency when it is not installed" OFF)
 
 if(LOGGER_BUILD_BENCHMARK)
     add_executable(logger_benchmark
@@ -47,6 +49,48 @@ if(LOGGER_BUILD_BENCHMARK)
 
     target_link_libraries(logger_benchmark PRIVATE
         logger
+    )
+endif()
+
+if(LOGGER_BUILD_SPDLOG_BENCHMARK)
+    find_package(spdlog CONFIG QUIET)
+
+    if(NOT TARGET spdlog::spdlog AND NOT TARGET spdlog::spdlog_header_only)
+        if(NOT LOGGER_FETCH_SPDLOG)
+            message(FATAL_ERROR
+                "spdlog is required for logger_spdlog_benchmark. Install it, or configure with "
+                "-DLOGGER_FETCH_SPDLOG=ON to fetch the pinned v1.17.0 dependency.")
+        endif()
+
+        include(FetchContent)
+        set(SPDLOG_BUILD_EXAMPLE OFF CACHE BOOL "" FORCE)
+        set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(SPDLOG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+        set(SPDLOG_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(
+            spdlog
+            GIT_REPOSITORY https://github.com/gabime/spdlog.git
+            GIT_TAG v1.17.0
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(spdlog)
+    endif()
+
+    if(TARGET spdlog::spdlog_header_only)
+        set(LOGGER_SPDLOG_TARGET spdlog::spdlog_header_only)
+    elseif(TARGET spdlog::spdlog)
+        set(LOGGER_SPDLOG_TARGET spdlog::spdlog)
+    else()
+        message(FATAL_ERROR "spdlog was found but did not export a supported CMake target")
+    endif()
+
+    add_executable(logger_spdlog_benchmark
+        benchmark/comparison_benchmark.cpp
+    )
+
+    target_link_libraries(logger_spdlog_benchmark PRIVATE
+        logger
+        ${LOGGER_SPDLOG_TARGET}
     )
 endif()
 

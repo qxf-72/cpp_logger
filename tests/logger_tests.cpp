@@ -95,6 +95,18 @@ std::size_t countOccurrences(const std::string& text, const std::string& needle)
   return count;
 }
 
+template <typename Predicate>
+bool waitUntil(Predicate&& predicate, std::chrono::milliseconds timeout) {
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  do {
+    if (predicate()) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  } while (std::chrono::steady_clock::now() < deadline);
+  return predicate();
+}
+
 void testBlockingQueueLifecycle() {
   BlockingQueue<std::string> queue;
 
@@ -127,6 +139,12 @@ void testBlockingQueueLifecycle() {
   const auto afterReset = queue.pop();
   CHECK(afterReset.has_value());
   CHECK(*afterReset == "after-reset");
+
+  CHECK(!queue.popBatchFor(batch, 1, std::chrono::milliseconds(1)));
+  CHECK(queue.push("timed-pop") == QueuePushResult::Enqueued);
+  CHECK(queue.popBatchFor(batch, 1, std::chrono::milliseconds(1)));
+  CHECK(batch.size() == 1);
+  CHECK(batch.front() == "timed-pop");
 }
 
 void testQueueOverflowPoliciesAndStats() {
@@ -242,6 +260,91 @@ void testInitializationValidationAndDirectoryCreation() {
 
   config.queueCapacity = 0;
   CHECK(!logger.init(config));
+
+  config.queueCapacity = 8;
+  config.writeBatchSize = 0;
+  CHECK(!logger.init(config));
+
+  config.writeBatchSize = 8;
+  config.flushPolicy = FlushPolicy::Periodic;
+  config.flushInterval = std::chrono::milliseconds::zero();
+  CHECK(!logger.init(config));
+}
+
+void testPeriodicFlushAndFileOwnership() {
+  auto& logger = Logger::instance();
+  logger.stop();
+
+  TemporaryDirectory temporaryDirectory("periodic_flush");
+  LoggerConfig config;
+  config.basePath = temporaryDirectory.path() / "app";
+  config.writeBatchSize = 8;
+  config.flushPolicy = FlushPolicy::Periodic;
+  config.flushInterval = std::chrono::milliseconds(30);
+  config.flushAtOrAbove = std::nullopt;
+  CHECK(logger.init(config));
+
+  std::string temporaryFile = "temporary-source.cpp";
+  logger.log(LogLevel::INFO, temporaryFile.c_str(), 42, "periodic-flush-message");
+  temporaryFile.assign("changed-after-log.cpp");
+
+  const bool becameVisible = waitUntil(
+      [&] {
+        return readAllLogs(temporaryDirectory.path()).find("periodic-flush-message") !=
+               std::string::npos;
+      },
+      std::chrono::seconds(1));
+  logger.stop();
+
+  const std::string contents = readAllLogs(temporaryDirectory.path());
+  CHECK(becameVisible);
+  CHECK(contents.find("[temporary-source.cpp:42]") != std::string::npos);
+  CHECK(contents.find("changed-after-log.cpp") == std::string::npos);
+}
+
+void testBinaryOutputUsesByteAccurateNewlines() {
+  auto& logger = Logger::instance();
+  logger.stop();
+
+  TemporaryDirectory temporaryDirectory("binary_output");
+  LoggerConfig config;
+  config.basePath = temporaryDirectory.path() / "app";
+  config.flushPolicy = FlushPolicy::OnStop;
+  config.flushAtOrAbove = std::nullopt;
+  CHECK(logger.init(config));
+  logger.log(LogLevel::INFO, "byte_test.cpp", 1, "byte-accurate-message");
+  logger.stop();
+
+  const std::vector<fs::path> files = logFiles(temporaryDirectory.path());
+  CHECK(files.size() == 1);
+  const std::string contents = readFile(files.front());
+  CHECK(contents.size() >= 2);
+  CHECK(contents.back() == '\n');
+  CHECK(contents[contents.size() - 2] != '\r');
+}
+
+void testLevelTriggeredFlush() {
+  auto& logger = Logger::instance();
+  logger.stop();
+
+  TemporaryDirectory temporaryDirectory("level_flush");
+  LoggerConfig config;
+  config.basePath = temporaryDirectory.path() / "app";
+  config.flushPolicy = FlushPolicy::Periodic;
+  config.flushInterval = std::chrono::seconds(10);
+  config.flushAtOrAbove = LogLevel::ERROR;
+  CHECK(logger.init(config));
+  logger.log(LogLevel::ERROR, "level_flush.cpp", 7, "error-triggered-flush-message");
+
+  const bool becameVisible = waitUntil(
+      [&] {
+        return readAllLogs(temporaryDirectory.path()).find("error-triggered-flush-message") !=
+               std::string::npos;
+      },
+      std::chrono::seconds(1));
+  logger.stop();
+
+  CHECK(becameVisible);
 }
 
 void testLevelFilteringAndRuntimeLevelChange() {
@@ -380,6 +483,9 @@ int main() {
       {"queue overflow policies and statistics", testQueueOverflowPoliciesAndStats},
       {"initialization validation and directory creation",
        testInitializationValidationAndDirectoryCreation},
+      {"periodic flush and file ownership", testPeriodicFlushAndFileOwnership},
+      {"binary output uses byte-accurate newlines", testBinaryOutputUsesByteAccurateNewlines},
+      {"level-triggered flush", testLevelTriggeredFlush},
       {"level filtering and runtime level change", testLevelFilteringAndRuntimeLevelChange},
       {"stop drains queued messages", testStopDrainsQueuedMessagesAndRejectsLaterMessages},
       {"size-based rotation", testSizeBasedRotation},
