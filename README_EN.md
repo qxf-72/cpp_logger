@@ -41,6 +41,8 @@ Application threads capture raw log records and push them into `BlockingQueue`; 
 cpp_logger/
 |-- benchmark/
 |   `-- benchmark.cpp
+|-- cmake/
+|   `-- cpp_loggerConfig.cmake.in
 |-- examples/
 |   `-- example.cpp
 |-- tests/
@@ -73,6 +75,29 @@ cd cpp_logger
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
+```
+
+### Install and Use as a CMake Package
+
+After building, install the static library, headers, and CMake package files:
+
+```bash
+cmake --install build --config Release --prefix <install-prefix>
+```
+
+Use the package from another CMake project with `find_package`:
+
+```cmake
+find_package(cpp_logger 0.1 CONFIG REQUIRED)
+
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE cpp_logger::logger)
+```
+
+Pass the installation prefix when configuring the consumer project:
+
+```bash
+cmake -S . -B build -DCMAKE_PREFIX_PATH=<install-prefix>
 ```
 
 ### Run Unit Tests
@@ -245,7 +270,7 @@ After `Logger::stop()` is called, the queue no longer accepts new logs. The back
 - [ ] Support console output
 - [x] Add unit tests
 - [ ] Support automatic cleanup of log files
-- [ ] Support installation and CMake package export
+- [x] Support installation and CMake package export
 
 ## 🤝 Contributing
 

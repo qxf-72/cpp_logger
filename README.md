@@ -41,6 +41,8 @@
 cpp_logger/
 ├── benchmark/
 │   └── benchmark.cpp
+├── cmake/
+│   └── cpp_loggerConfig.cmake.in
 ├── examples/
 │   └── example.cpp
 ├── tests/
@@ -73,6 +75,29 @@ cd cpp_logger
 
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release
+```
+
+### 安装与 CMake package
+
+构建完成后可安装静态库、头文件和 CMake package 文件：
+
+```bash
+cmake --install build --config Release --prefix <安装目录>
+```
+
+其他 CMake 项目可通过 `find_package` 使用：
+
+```cmake
+find_package(cpp_logger 0.1 CONFIG REQUIRED)
+
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE cpp_logger::logger)
+```
+
+配置消费者项目时，将安装目录传给 CMake：
+
+```bash
+cmake -S . -B build -DCMAKE_PREFIX_PATH=<安装目录>
 ```
 
 ### 运行单元测试
@@ -245,7 +270,7 @@ app_2026-06-26_0.log
 - [ ] 支持控制台输出
 - [x] 添加单元测试
 - [ ] 支持日志文件自动清理
-- [ ] 支持安装和导出 CMake package
+- [x] 支持安装和导出 CMake package
 
 ## 🤝 Contributing
 
