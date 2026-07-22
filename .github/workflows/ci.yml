@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 验证主流平台上的构建、单元测试和 CMake 安装规则。
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 CMake
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+          -DLOGGER_BUILD_BENCHMARK=OFF
+          -DLOGGER_BUILD_SPDLOG_BENCHMARK=OFF
+
+      - name: 构建
+        run: cmake --build build --parallel
+
+      - name: 运行 CTest 单元测试
+        run: ctest --test-dir build --output-on-failure
+
+      - name: 验证安装规则
+        run: cmake --install build --prefix install
