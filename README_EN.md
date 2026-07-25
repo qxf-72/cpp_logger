@@ -1,151 +1,65 @@
 <div align="center">
 
-# C++ Cross-Platform Asynchronous Logging System
+# cpp_logger
 
-[English](README_EN.md) | [简体中文](README.md)
+**A lightweight asynchronous logging library for C++17**
 
-A lightweight cross-platform multithreaded asynchronous logging system implemented in C++17.
+English | [简体中文](README.md)
 
-Application threads capture raw log records and push them into `BlockingQueue`; a background thread formats and writes batches to disk, shortening the logging path in application threads.
-
+[![CI](https://github.com/qxf-72/cpp_logger/actions/workflows/ci.yml/badge.svg)](https://github.com/qxf-72/cpp_logger/actions/workflows/ci.yml)
 ![C++](https://img.shields.io/badge/C%2B%2B-17-blue.svg)
 ![CMake](https://img.shields.io/badge/CMake-3.14%2B-brightgreen.svg)
-![GitHub top language](https://img.shields.io/github/languages/top/qxf-72/cpp_logger)
-![Platform](https://img.shields.io/badge/Platform-Cross%20platform-brightgreen.svg)
+![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-brightgreen.svg)
 ![License](https://img.shields.io/badge/License-MIT-yellow.svg)
-
-⭐ If this project helps you, a Star is appreciated!
 
 </div>
 
-## ✨ Features
+`cpp_logger` queues log records in application threads, then lets a background thread format and write them to files in batches. It includes configurable overload policies, file rotation, flush policies, runtime statistics, CTest coverage, and an installable CMake package.
 
-- Supports five log levels: `DEBUG / INFO / WARN / ERROR / FATAL`
-- Supports log level filtering to avoid unnecessary string construction
-- Supports millisecond-precision timestamps
-- Records thread ID, source file name, and line number
-- Provides convenient macros such as `LOG_INFO("message")`
-- Implements a producer-consumer model based on `BlockingQueue`
-- Writes logs asynchronously through a background thread
-- Supports automatic log file rotation by date
-- Supports automatic log file rotation by file size
-- Supports configurable bounded-queue capacity and full-queue policies (block, drop newest, drop oldest)
-- Exposes dropped-log count, current queue size, and queue peak size
-- Formats and writes batches in the background to reduce stream-output overhead
-- Supports safe shutdown and drains remaining logs in the queue
-- Uses CMake to build a static library, demo program, and performance benchmark
+## ✨ Highlights
 
-## 📁 Project Structure
+| Capability | Details |
+| --- | --- |
+| Asynchronous writing | Application threads submit `LogRecord` objects; the background thread formats, rotates, and writes files. |
+| Bounded queue | `Block`, `DropNewest`, and `DropOldest` policies are available when the queue is full. |
+| Batch processing | Records are popped, formatted, and written in batches to reduce synchronization and stream overhead. |
+| Observability | `droppedCount()`, `queueSize()`, and `queuePeakSize()` expose queue state. |
+| Log management | Five levels, millisecond timestamps, thread IDs, source locations, and date/size rotation. |
+| Shutdown and flushing | On-stop, periodic, and per-batch flushing; `stop()` drains accepted records. |
+| Tooling | CTest, cross-platform GitHub Actions CI, and `find_package` package export. |
 
-```text
-cpp_logger/
-|-- benchmark/
-|   `-- benchmark.cpp
-|-- cmake/
-|   `-- cpp_loggerConfig.cmake.in
-|-- examples/
-|   `-- example.cpp
-|-- tests/
-|   `-- logger_tests.cpp
-|-- include/
-|   |-- BlockingQueue.h
-|   `-- Logger.h
-|-- src/
-|   `-- Logger.cpp
-|-- CMakeLists.txt
-|-- LICENSE
-|-- README.md
-`-- README_EN.md
-```
-
-## 🚀 Build and Run
+## 🚀 Quick Start
 
 ### Requirements
 
-- Windows, Linux, or macOS
-- C++17 or later
+- A C++17 compiler: GCC, Clang, or MSVC
 - CMake 3.14 or later
-- GCC, Clang, or MSVC
+- Ninja is recommended; another locally available CMake generator also works
 
-### Build
+The commands below use Ninja:
 
 ```bash
 git clone https://github.com/qxf-72/cpp_logger.git
 cd cpp_logger
 
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-```
-
-### Install and Use as a CMake Package
-
-After building, install the static library, headers, and CMake package files:
-
-```bash
-cmake --install build --config Release --prefix <install-prefix>
-```
-
-Use the package from another CMake project with `find_package`:
-
-```cmake
-find_package(cpp_logger 0.1 CONFIG REQUIRED)
-
-add_executable(app main.cpp)
-target_link_libraries(app PRIVATE cpp_logger::logger)
-```
-
-Pass the installation prefix when configuring the consumer project:
-
-```bash
-cmake -S . -B build -DCMAKE_PREFIX_PATH=<install-prefix>
-```
-
-### Run Unit Tests
-
-The project integrates automated unit tests with CTest. The default configuration builds `logger_tests`; run it after building:
-
-```bash
-# Single-config generators such as Ninja and Unix Makefiles
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel
 ctest --test-dir build --output-on-failure
-
-# Multi-config generators such as Visual Studio
-ctest --test-dir build -C Release --output-on-failure
 ```
 
-The tests cover the blocking queue lifecycle and full-queue policies, initialization validation, log-level filtering, queue draining in `stop()`, size-based rotation, reinitialization, and concurrent logging.
-
-After the build completes, the following CMake targets are generated:
-
-```text
-build/
-|-- logger (static library; file extension depends on the toolchain)
-|-- logger_demo
-|-- logger_benchmark
-`-- logger_tests
-```
-
-### Run the Demo
-
-For single-config generators such as Ninja or Unix Makefiles:
+Run the demo:
 
 ```bash
+# Linux / macOS
 ./build/logger_demo
+
+# Windows PowerShell
+.\build\logger_demo.exe
 ```
 
-For multi-config generators such as Visual Studio:
+Logs are written to `logs/` by default.
 
-```bash
-./build/Release/logger_demo
-```
-
-View the generated log files:
-
-```bash
-ls logs/app_*.log
-tail -n 20 logs/app_*.log
-```
-
-## 📖 Usage Example
+## 🧩 Usage
 
 ```cpp
 #include <chrono>
@@ -159,7 +73,7 @@ int main() {
   config.minLevel = LogLevel::DEBUG;
   config.maxFileSize = 10 * 1024 * 1024;
   config.queueCapacity = 8192;
-  config.overflowPolicy = OverflowPolicy::DropNewest;
+  config.overflowPolicy = OverflowPolicy::Block;
   config.writeBatchSize = 256;
   config.flushPolicy = FlushPolicy::Periodic;
   config.flushInterval = std::chrono::seconds(1);
@@ -173,167 +87,156 @@ int main() {
   LOG_INFO("program started");
   LOG_WARN("warning message");
   LOG_ERROR("error message");
-  LOG_FATAL("fatal message");
 
   std::cout << "dropped=" << Logger::instance().droppedCount() << '\n';
   Logger::instance().stop();
-  return 0;
 }
 ```
 
+`LOG_DEBUG`, `LOG_INFO`, `LOG_WARN`, `LOG_ERROR`, and `LOG_FATAL` check the configured level before evaluating the message expression, avoiding unnecessary string construction for filtered logs.
+
 The original `init("app", LogLevel::DEBUG, 10 * 1024 * 1024)` overload remains available. It uses the default capacity of `8192`, the `Block` policy, 256-record batches, and periodic flushing.
 
-## 🧱 Bounded Queue and Full-Queue Policies
-
-`LoggerConfig::queueCapacity` must be greater than `0`; its default is `8192`. When the queue is full, `overflowPolicy` controls the behavior:
+### Full-Queue Policies
 
 | Policy | Behavior | Suitable when |
 | --- | --- | --- |
-| `OverflowPolicy::Block` | Blocks producers until the background thread consumes a message | Logs must not be lost |
-| `OverflowPolicy::DropNewest` | Drops the new message and returns immediately | Throughput and application latency take priority |
-| `OverflowPolicy::DropOldest` | Drops the oldest queued message and retains the new one | Recent state matters most during troubleshooting |
+| `OverflowPolicy::Block` | Blocks producers until the background thread consumes a record or the logger closes. | Logs cannot be lost. |
+| `OverflowPolicy::DropNewest` | Drops the incoming record and returns immediately. | Application latency takes priority. |
+| `OverflowPolicy::DropOldest` | Removes the oldest queued record and retains the incoming one. | The latest state is most useful for diagnosis. |
 
-`droppedCount()` counts losses caused by either dropping policy; `queueSize()` returns the pending-message count; `queuePeakSize()` returns the peak queue size for the current initialization. A successful `init()` resets all three statistics.
+`droppedCount()` counts losses caused by either drop policy. `queueSize()` is the pending-record count, while `queuePeakSize()` is the peak size for the current initialization. A successful `init()` resets all three statistics.
 
-## 💾 Flush and Batch Policies
+### Batching and Flushing
 
-`writeBatchSize` controls the maximum records formatted and written together; it defaults to `256`. `flushPolicy` controls when the C++ stream is flushed to the operating-system buffer:
+| Setting | Meaning |
+| --- | --- |
+| `writeBatchSize` | Maximum records formatted and written together; defaults to `256`. |
+| `FlushPolicy::OnStop` | Flushes only in `stop()`, except records at `flushAtOrAbove`. |
+| `FlushPolicy::Periodic` | Flushes at `flushInterval`, one second by default; this is the default policy. |
+| `FlushPolicy::EveryBatch` | Flushes after every writer batch, improving visibility at a higher cost. |
 
-| Policy | Behavior | Suitable when |
-| --- | --- | --- |
-| `FlushPolicy::OnStop` | Flushes on `stop()` only, except for `flushAtOrAbove` records | Maximum throughput; explicit graceful shutdown is guaranteed |
-| `FlushPolicy::Periodic` | Flushes at `flushInterval` (1 second by default), and for `flushAtOrAbove` records | Default balance between throughput and observability |
-| `FlushPolicy::EveryBatch` | Flushes after every writer batch | Lower visibility latency at higher overhead |
+`flushAtOrAbove` defaults to `LogLevel::ERROR`; set it to `std::nullopt` to disable level-triggered flushes. `std::ofstream::flush()` flushes the C++ stream to the operating system, but is not `fsync` and does not provide power-loss durability.
 
-`flushAtOrAbove` defaults to `LogLevel::ERROR`; set it to `std::nullopt` to disable level-triggered flushing. A level-triggered flush occurs after the background thread processes the record, so it does not make the producer call synchronous. `std::ofstream::flush()` is not `fsync` and does not provide power-loss durability.
+## 🏗️ Core Data Flow
 
-## 📝 Log Format
-
-```text
-[2026-06-25 12:00:00.123][INFO][tid:140123456789000][../examples/example.cpp:42] message
+```mermaid
+flowchart LR
+    P[Application thread] --> R[Capture LogRecord]
+    R --> Q[Bounded BlockingQueue]
+    Q --> W[Background logger thread]
+    W --> F[Format a batch]
+    F --> O[Date/size rotation]
+    O --> D[Write a batch to file]
 ```
 
-Format description:
+- Application threads capture the timestamp, level, thread ID, source location, and message, then enqueue the record; string formatting is deferred to the background thread.
+- `close()` wakes waiting threads. `stop()` rejects later writes, drains accepted records, then flushes and closes the file.
+- Lifecycle synchronization and queue generations prevent producers from an old lifecycle writing into a reinitialized queue.
+
+The log format is:
 
 ```text
-[time][log level][thread ID][source file:line] log message
+[2026-06-25 12:00:00.123][INFO][tid:140123456789000][example.cpp:42] message
 ```
 
-## 🗂️ Log Rotation
+Log files use `<prefix>_<date>_<index>.log`, for example `app_2026-06-25_0.log`. A new file is created when the date changes or the file reaches `maxFileSize`.
 
-Log file name format:
+## ✅ Tests and CI
 
-```text
-file_prefix_date_index.log
-```
+On every push to `main` and every pull request, GitHub Actions configures, builds, runs CTest, and validates CMake installation on Windows, Linux, and macOS.
 
-Examples:
-
-```text
-app_2026-06-25_0.log
-app_2026-06-25_1.log
-app_2026-06-26_0.log
-```
-
-Rotation rules:
-
-- When the date changes, a new `0` log file is created for the new date
-- When the current log file reaches the size limit, the file index is incremented
-- Multiple log files can be generated on the same day
-
-## 🏗️ Core Design
-
-```text
-application thread
-  `-- capture timestamp, level, thread ID, source location, and message
-        `-- push into BlockingQueue
-              `-- return or wait for capacity according to the overflow policy
-
-background logging thread
-  `-- pop a batch from BlockingQueue
-        `-- format records and check whether rotation is needed
-              `-- write the batch to the log file
-```
-
-`BlockingQueue` uses:
-
-- `std::mutex` to protect the shared queue
-- `std::condition_variable` to block and wake the consumer
-- `close()` to wake the background thread and exit safely
-
-After `Logger::stop()` is called, the queue no longer accepts new logs. The background thread processes all existing logs, then flushes and closes the log file.
-
-## 🛣️ Roadmap
-
-- [x] Add performance tests for asynchronous logging
-- [x] Support a bounded queue and full-queue policies
-- [ ] Support console output
-- [x] Add unit tests
-- [ ] Support automatic cleanup of log files
-- [x] Support installation and CMake package export
-
-## 🤝 Contributing
-
-Issues and Pull Requests are welcome.
-
-Before submitting code, make sure the following command completes successfully:
+Run tests locally:
 
 ```bash
-cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
-Please also keep the code style consistent.
+Tests cover queue lifecycle and overload policies, configuration validation, level filtering, safe draining during `stop()`, size rotation, reinitialization, and concurrent logging.
+
+## 📦 Install and Use as a CMake Package
+
+Install the static library, headers, and CMake package after building:
+
+```bash
+cmake --install build --prefix <install-prefix>
+```
+
+Consume it from another CMake project:
+
+```cmake
+find_package(cpp_logger 0.1 CONFIG REQUIRED)
+
+add_executable(app main.cpp)
+target_link_libraries(app PRIVATE cpp_logger::logger)
+```
+
+Pass the installation prefix when configuring the consumer:
+
+```bash
+cmake -S . -B build -DCMAKE_PREFIX_PATH=<install-prefix>
+```
 
 ## 📊 Benchmark
 
-After building, run `logger_benchmark` to measure both producer submission throughput and end-to-end throughput after all logs are persisted.
+The regular benchmark target is enabled by default and produces CSV output. It reports both producer submission throughput and end-to-end throughput after `stop()` drains and flushes the queue.
 
 ```bash
-# Single-config generators such as Ninja or Unix Makefiles
+# Linux / macOS
 ./build/logger_benchmark --threads 4 --messages 50000 --payload 128 --runs 5
 
-# Multi-config generators such as Visual Studio
-./build/Release/logger_benchmark --threads 4 --messages 50000 --payload 128 --runs 5
+# Windows PowerShell
+.\build\logger_benchmark.exe --threads 4 --messages 50000 --payload 128 --runs 5
 ```
 
-Available options:
+| Option | Description |
+| --- | --- |
+| `--threads <N>` | Producer count; default: 4. |
+| `--messages <N>` | Records per producer; default: 50000. |
+| `--payload <N>` | Message body size in bytes; default: 128. |
+| `--runs <N>` | Repeated runs; default: 3. |
+| `--batch-size <N>` | Writer batch size; default: 256. |
+| `--flush-policy <...>` | `on-stop`, `periodic`, or `every-batch`. |
 
-```text
---threads <N>    Producer thread count
---messages <N>   Messages written by each producer
---payload <N>    Payload size of each message in bytes
---runs <N>       Number of repeated runs
---output <PATH>  Directory for temporary log files
---keep-logs      Keep log files generated by each run
-```
-
-The output is CSV. `producer_logs_per_second` measures submission by producer threads only, while `end_to_end_logs_per_second` also includes `stop()` draining the queue and flushing the log file. `--batch-size`, `--flush-policy`, and `--flush-interval-ms` expose the writer configuration. Temporary logs are removed after each run unless `--keep-logs` is specified.
-
-### cpp_logger vs spdlog
-
-The comparison target is opt-in, so normal builds do not download dependencies. It first looks for an installed spdlog package; append `-DLOGGER_FETCH_SPDLOG=ON` to fetch the pinned v1.17.0 dependency into the build directory when none is found.
+An optional comparison target pins `spdlog` to v1.17.0. It is off by default, so regular builds do not download dependencies. When `spdlog` is unavailable locally, CMake can fetch it into the build tree:
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
-  -DLOGGER_BUILD_SPDLOG_BENCHMARK=ON -DLOGGER_FETCH_SPDLOG=ON
-cmake --build build --config Release
+cmake -S . -B build-spdlog -G Ninja -DCMAKE_BUILD_TYPE=Release -DLOGGER_BUILD_SPDLOG_BENCHMARK=ON -DLOGGER_FETCH_SPDLOG=ON
+cmake --build build-spdlog --parallel
 
-./build/logger_spdlog_benchmark --threads 4 --messages 250000 --payload 128 --runs 3
+# Linux / macOS
+./build-spdlog/logger_spdlog_benchmark --threads 4 --messages 250000 --payload 128 --runs 3
+
+# Windows PowerShell
+.\build-spdlog\logger_spdlog_benchmark.exe --threads 4 --messages 250000 --payload 128 --runs 3
 ```
 
-The runner prints a Markdown table for four predefined modes. Both Block modes use one asynchronous writer thread, the same 8192-record queue capacity, the same message payload and source-location pattern, and a periodic 1-second flush policy. `spdlog reference` is therefore a control for the balanced mode. The producer rate counts attempts; the end-to-end rate counts accepted records, so the DropNewest profile does not hide loss behind a high submission rate.
+One local Release measurement, using four producers, 250,000 records per producer, a 128-byte payload, and three runs per profile, produced the following results. These figures are for same-machine revision comparison only, not a general performance claim.
 
-| Mode | Queue policy | Flush policy | Producer throughput | End-to-end throughput | Drop rate |
+| Mode | Queue policy | Flush policy | Producer rate | End-to-end rate | Drop rate |
 | --- | --- | --- | ---: | ---: | ---: |
 | Reliable (`cpp_logger`) | Block | EveryBatch | 686,509 logs/s | 679,626 logs/s | 0.0000% |
 | Balanced (`cpp_logger`) | Block | Periodic 1 s | 675,741 logs/s | 669,458 logs/s | 0.0000% |
 | Producer-low-latency (`cpp_logger`) | DropNewest | Periodic 1 s | 6,126,948 logs/s | 778,154 logs/s | 86.4329% |
 | spdlog reference (v1.17.0) | Block | Periodic 1 s | 581,949 logs/s | 579,614 logs/s | 0.0000% |
 
-The table above was measured in the same local Release build with four producer threads, 250,000 messages per thread, a 128-byte payload, and three runs per mode. Results depend on CPU, storage, filesystem caching, compiler, and system load; use the command above to compare revisions on the same machine.
+The compared modes use one asynchronous writer, an 8192-record queue, the same payload, and the same source-location pattern. CPU, storage, filesystem cache, compiler, and system load all affect results; rerun the command on the same machine when comparing revisions.
 
-`std::ofstream::flush()` flushes the C++ stream and operating-system buffers, but is not equivalent to physical-disk `fsync`. The end-to-end figure therefore measures queue draining and flushing by the logger, not power-loss-safe persistence latency.
+## 🗺️ Roadmap
+
+- [ ] Console and pluggable output sinks
+- [ ] Log-retention and automatic-cleanup policies
+- [ ] More CI checks, including formatting and static analysis
+
+## 🤝 Contributing
+
+Issues and pull requests are welcome. Before submitting code, run:
+
+```bash
+cmake --build build --parallel
+ctest --test-dir build --output-on-failure
+```
 
 ## 📄 License
 
-This project is licensed under the MIT License.
+Licensed under the [MIT License](LICENSE).
