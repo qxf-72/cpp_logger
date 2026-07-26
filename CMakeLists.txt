@@ -29,7 +29,9 @@ target_include_directories(logger PUBLIC # 凡是链接 logger 的目标，也�
 target_compile_features(logger PUBLIC cxx_std_17)
 
 if(MSVC)
-    target_compile_options(logger PRIVATE /W4 /permissive-)
+    # 源码和中文注释统一按 UTF-8 保存；避免 MSVC 使用本地代码页解析时破坏字符串或注释。
+    add_compile_options(/utf-8)
+    target_compile_options(logger PRIVATE /W4 /permissive- /utf-8)
 else()
     target_compile_options(logger PRIVATE -Wall -Wextra -Wpedantic)
 endif()

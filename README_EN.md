@@ -243,16 +243,16 @@ foreach ($threads in 4, 8, 16) {
 }
 ```
 
-The spdlog benchmark is built independently. It uses the pinned header-only target and one async worker, so it does not share global backend state with Quill:
+The spdlog benchmark is built independently. It uses the pinned header-only target and one async worker, so it does not share global backend state with Quill. The following Windows MSVC x64 commands produced the spdlog rows in this table:
 
 ```bash
-cmake -S . -B build-spdlog -G Ninja -DCMAKE_BUILD_TYPE=Release -DLOGGER_BUILD_SPDLOG_BENCHMARK=ON -DLOGGER_FETCH_SPDLOG=ON
-cmake --build build-spdlog --target logger_spdlog_benchmark --parallel
+cmake -S . -B build-spdlog-msvc -G "Visual Studio 17 2022" -A x64 -DLOGGER_BUILD_SPDLOG_BENCHMARK=ON -DLOGGER_FETCH_SPDLOG=ON
+cmake --build build-spdlog-msvc --config Release --target logger_spdlog_benchmark --parallel
 
 # Windows PowerShell: run only the two profiles aligned with the table.
 foreach ($threads in 4, 8, 16) {
-  .\build-spdlog\logger_spdlog_benchmark.exe --threads $threads --messages 250000 --payload 128 --runs 3 --profile reliable_periodic
-  .\build-spdlog\logger_spdlog_benchmark.exe --threads $threads --messages 250000 --payload 128 --runs 3 --profile discard_new
+  .\build-spdlog-msvc\Release\logger_spdlog_benchmark.exe --threads $threads --messages 250000 --payload 128 --runs 3 --profile reliable_periodic
+  .\build-spdlog-msvc\Release\logger_spdlog_benchmark.exe --threads $threads --messages 250000 --payload 128 --runs 3 --profile discard_new
 }
 ```
 
@@ -260,7 +260,7 @@ Quill requires a thread to use only one `FrontendOptions` type, so reliable and 
 
 ### Local Quill and spdlog comparison results
 
-The `cpp_logger` and Quill rows retain results from 2026-07-26. The spdlog v1.17.0 rows were independently rerun on 2026-07-27 with the same Windows, MSYS2 MinGW-w64 GCC 15.2.0, Release environment and parameters. Every configuration used three runs, 250,000 records per producer, a 128-byte payload, local-time millisecond text-file output, and one-second periodic flushing. Rates are derived from the mean duration across the three runs.
+The `cpp_logger` and Quill rows retain results from 2026-07-26 on Windows, MSYS2 MinGW-w64 GCC 15.2.0, and Release. The spdlog v1.17.0 rows were independently rerun on 2026-07-27 with Windows, Visual Studio 2022 x64, MSVC 19.40.33811, and Release. Every configuration used three runs, 250,000 records per producer, a 128-byte payload, local-time millisecond text-file output, and one-second periodic flushing. Rates are derived from the mean duration across the three runs. Because the compilers differ, the spdlog rows describe only this specific configuration and cannot support a strict cross-library ranking.
 
 All implementations use one background thread for formatting and file I/O. `cpp_logger` uses `2048 × producer count` record slots and a batch size of 256. spdlog uses a global MPMC async queue with the same `2048 × producer count` record capacity. Quill uses `UnboundedBlocking` for reliable delivery (256 KiB initial and 64 MiB maximum per producer) and a 256 KiB-per-producer `BoundedDropping` queue for drop-newest. Queue topology and capacity units are not identical, so this is a **semantically aligned** end-to-end experiment, not a capacity-identical microbenchmark. Quill's backend uses busy waiting with idle `yield` here because Windows expands its default 500 ns idle sleep to millisecond-scale scheduling delays; this increases CPU use and should not be extrapolated to low-CPU scenarios.
 
@@ -271,10 +271,10 @@ All implementations use one background thread for formatting and file I/O. `cpp_
 | Scenario / implementation | Queue policy | Flush policy | Producer rate (10k logs/s) | End-to-end rate (10k logs/s) | Drop rate |
 | --- | --- | --- | ---: | ---: | ---: |
 | Reliable / periodic (`cpp_logger`) | Block | Periodic 1 s | 124.92 | 123.80 | 0.0000% |
-| Reliable / periodic (spdlog v1.17.0) | Block | Periodic 1 s | 17.59 | 17.58 | 0.0000% |
+| Reliable / periodic (spdlog v1.17.0, MSVC) | Block | Periodic 1 s | 48.30 | 48.16 | 0.0000% |
 | Reliable / periodic (Quill) | UnboundedBlocking | Periodic 1 s | 874.92 | 80.53 | 0.0000% |
 | Loss-tolerant / discard newest (`cpp_logger`) | DropNewest | Periodic 1 s | 309.61 | 120.15 | 60.3628% |
-| Loss-tolerant / discard newest (spdlog v1.17.0) | DiscardNew | Periodic 1 s | 537.48 | 53.37 | 89.8039% |
+| Loss-tolerant / discard newest (spdlog v1.17.0, MSVC) | DiscardNew | Periodic 1 s | 460.29 | 76.98 | 82.7957% |
 | Loss-tolerant / discard newest (Quill) | BoundedDropping | Periodic 1 s | 5273.86 | 80.30 | 97.4055% |
 
 #### 8 producers
@@ -282,10 +282,10 @@ All implementations use one background thread for formatting and file I/O. `cpp_
 | Scenario / implementation | Queue policy | Flush policy | Producer rate (10k logs/s) | End-to-end rate (10k logs/s) | Drop rate |
 | --- | --- | --- | ---: | ---: | ---: |
 | Reliable / periodic (`cpp_logger`) | Block | Periodic 1 s | 103.37 | 102.60 | 0.0000% |
-| Reliable / periodic (spdlog v1.17.0) | Block | Periodic 1 s | 10.43 | 10.42 | 0.0000% |
+| Reliable / periodic (spdlog v1.17.0, MSVC) | Block | Periodic 1 s | 33.91 | 33.83 | 0.0000% |
 | Reliable / periodic (Quill) | UnboundedBlocking | Periodic 1 s | 943.82 | 73.11 | 0.0000% |
 | Loss-tolerant / discard newest (`cpp_logger`) | DropNewest | Periodic 1 s | 230.12 | 103.53 | 54.2425% |
-| Loss-tolerant / discard newest (spdlog v1.17.0) | DiscardNew | Periodic 1 s | 409.37 | 25.31 | 93.6654% |
+| Loss-tolerant / discard newest (spdlog v1.17.0, MSVC) | DiscardNew | Periodic 1 s | 428.28 | 47.40 | 88.6532% |
 | Loss-tolerant / discard newest (Quill) | BoundedDropping | Periodic 1 s | 5906.90 | 65.62 | 97.8928% |
 
 #### 16 producers
@@ -293,16 +293,16 @@ All implementations use one background thread for formatting and file I/O. `cpp_
 | Scenario / implementation | Queue policy | Flush policy | Producer rate (10k logs/s) | End-to-end rate (10k logs/s) | Drop rate |
 | --- | --- | --- | ---: | ---: | ---: |
 | Reliable / periodic (`cpp_logger`) | Block | Periodic 1 s | 72.30 | 71.62 | 0.0000% |
-| Reliable / periodic (spdlog v1.17.0) | Block | Periodic 1 s | 9.27 | 9.27 | 0.0000% |
+| Reliable / periodic (spdlog v1.17.0, MSVC) | Block | Periodic 1 s | 33.77 | 33.70 | 0.0000% |
 | Reliable / periodic (Quill) | UnboundedBlocking | Periodic 1 s | 843.36 | 68.28 | 0.0000% |
 | Loss-tolerant / discard newest (`cpp_logger`) | DropNewest | Periodic 1 s | 123.35 | 36.84 | 69.7742% |
-| Loss-tolerant / discard newest (spdlog v1.17.0) | DiscardNew | Periodic 1 s | 451.18 | 18.22 | 95.8711% |
+| Loss-tolerant / discard newest (spdlog v1.17.0, MSVC) | DiscardNew | Periodic 1 s | 463.51 | 26.23 | 94.1834% |
 | Loss-tolerant / discard newest (Quill) | BoundedDropping | Periodic 1 s | 6194.27 | 46.62 | 98.3951% |
 
 Analysis:
 
-- All three reliable profiles retain their records. Quill's much higher producer rate reflects its per-producer SPSC queues and deferred formatting; in this machine's real text-file write metric, `cpp_logger` is higher than the fixed global-queue, single-worker spdlog configuration used here. The libraries optimize different paths, so neither rate alone is sufficient.
-- In discard-newest mode, Quill and spdlog submit attempts quickly but reject roughly 90% to more than 97% of them. Those figures are not reliable-write capacity. `cpp_logger` drops less on this setup, but the right choice still depends on the application's loss budget.
+- All three reliable profiles retain their records. spdlog's MSVC figures use a global MPMC queue and one worker, while the cpp_logger and Quill rows come from MinGW. Compiler, standard-library, and file-I/O implementation differences affect the results, so they cannot be treated as a strict cross-library throughput ranking.
+- In discard-newest mode, Quill and spdlog submit attempts quickly but reject roughly 82.8% to more than 97% of them. Those figures are not reliable-write capacity. End-to-end throughput must be considered together with retained-record count and the application's loss budget.
 - spdlog's async queue, Quill's per-producer SPSC queue, their formatters, and their file sinks all differ from this project. These data only describe the configurations above; they are not a general cross-platform, cross-compiler, or cross-storage ranking.
 - `DropOldest` remains covered by this project's unit tests. spdlog's `OverrunOldest` is related, but because this run did not remeasure the matching `cpp_logger::DropOldest` profile, it is not placed in the table or used for a horizontal conclusion.
 

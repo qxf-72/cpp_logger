@@ -243,16 +243,16 @@ foreach ($threads in 4, 8, 16) {
 }
 ```
 
-spdlog 基准独立构建，固定使用其 header-only 目标和一个异步后台线程；它不会与 Quill 的全局后端状态混用：
+spdlog 基准独立构建，固定使用其 header-only 目标和一个异步后台线程；它不会与 Quill 的全局后端状态混用。以下是本表 spdlog 数据使用的 Windows MSVC x64 构建命令：
 
 ```bash
-cmake -S . -B build-spdlog -G Ninja -DCMAKE_BUILD_TYPE=Release -DLOGGER_BUILD_SPDLOG_BENCHMARK=ON -DLOGGER_FETCH_SPDLOG=ON
-cmake --build build-spdlog --target logger_spdlog_benchmark --parallel
+cmake -S . -B build-spdlog-msvc -G "Visual Studio 17 2022" -A x64 -DLOGGER_BUILD_SPDLOG_BENCHMARK=ON -DLOGGER_FETCH_SPDLOG=ON
+cmake --build build-spdlog-msvc --config Release --target logger_spdlog_benchmark --parallel
 
 # Windows PowerShell：仅运行与表格语义对齐的两个 Profile。
 foreach ($threads in 4, 8, 16) {
-  .\build-spdlog\logger_spdlog_benchmark.exe --threads $threads --messages 250000 --payload 128 --runs 3 --profile reliable_periodic
-  .\build-spdlog\logger_spdlog_benchmark.exe --threads $threads --messages 250000 --payload 128 --runs 3 --profile discard_new
+  .\build-spdlog-msvc\Release\logger_spdlog_benchmark.exe --threads $threads --messages 250000 --payload 128 --runs 3 --profile reliable_periodic
+  .\build-spdlog-msvc\Release\logger_spdlog_benchmark.exe --threads $threads --messages 250000 --payload 128 --runs 3 --profile discard_new
 }
 ```
 
@@ -260,7 +260,7 @@ Quill 要求同一线程只使用一种 `FrontendOptions`，所以可靠与丢�
 
 ### 本机 Quill 与 spdlog 对照结果
 
-`cpp_logger` 与 Quill 行保留 2026-07-26 的结果；spdlog v1.17.0 行于 2026-07-27 在相同 Windows、MSYS2 MinGW-w64 GCC 15.2.0、Release 环境与参数下独立重测。每个配置均为 3 轮，每个生产者写入 250,000 条、正文 128 B，并使用本地时间毫秒格式的文本文件输出和 1 秒周期刷新；吞吐量由三轮平均耗时计算。
+`cpp_logger` 与 Quill 行保留 2026-07-26 在 Windows、MSYS2 MinGW-w64 GCC 15.2.0、Release 下的结果；spdlog v1.17.0 行于 2026-07-27 在 Windows、Visual Studio 2022 x64、MSVC 19.40.33811、Release 下独立重测。每个配置均为 3 轮，每个生产者写入 250,000 条、正文 128 B，并使用本地时间毫秒格式的文本文件输出和 1 秒周期刷新；吞吐量由三轮平均耗时计算。由于编译器不同，表中 spdlog 行只记录该具体配置，不能据此做严格的跨库优劣结论。
 
 各实现均以单后台线程完成格式化和文件 I/O。`cpp_logger` 的队列容量为 `2048 × 生产者数` 条记录，默认批量大小为 256；spdlog 使用容量同为 `2048 × 生产者数` 条记录的全局 MPMC 异步队列；Quill 的可靠模式使用 `UnboundedBlocking`（每生产者初始 256 KiB、最大 64 MiB），丢新模式使用每生产者 256 KiB 的 `BoundedDropping`。容量单位和队列拓扑并不完全相同，因此这是一项**语义尽量对齐**的端到端实验，而不是容量完全相等的微基准。为避免 Windows 将 Quill 默认 500 ns 空闲休眠放大为毫秒级，Quill 后台线程采用忙等、空闲时 `yield` 的配置；这会提高 CPU 占用，结果不应外推到低 CPU 功耗场景。
 
@@ -271,10 +271,10 @@ Quill 要求同一线程只使用一种 `FrontendOptions`，所以可靠与丢�
 | 场景 / 实现 | 队列策略 | 刷新策略 | 生产者吞吐量（万条/秒） | 端到端吞吐量（万条/秒） | 丢弃率 |
 | --- | --- | --- | ---: | ---: | ---: |
 | 可靠 / 周期刷新（cpp_logger） | Block | Periodic 1 s | 124.92 | 123.80 | 0.0000% |
-| 可靠 / 周期刷新（spdlog v1.17.0） | Block | Periodic 1 s | 17.59 | 17.58 | 0.0000% |
+| 可靠 / 周期刷新（spdlog v1.17.0，MSVC） | Block | Periodic 1 s | 48.30 | 48.16 | 0.0000% |
 | 可靠 / 周期刷新（Quill） | UnboundedBlocking | Periodic 1 s | 874.92 | 80.53 | 0.0000% |
 | 容忍丢失 / 丢新（cpp_logger） | DropNewest | Periodic 1 s | 309.61 | 120.15 | 60.3628% |
-| 容忍丢失 / 丢新（spdlog v1.17.0） | DiscardNew | Periodic 1 s | 537.48 | 53.37 | 89.8039% |
+| 容忍丢失 / 丢新（spdlog v1.17.0，MSVC） | DiscardNew | Periodic 1 s | 460.29 | 76.98 | 82.7957% |
 | 容忍丢失 / 丢新（Quill） | BoundedDropping | Periodic 1 s | 5273.86 | 80.30 | 97.4055% |
 
 #### 8 个生产者
@@ -282,10 +282,10 @@ Quill 要求同一线程只使用一种 `FrontendOptions`，所以可靠与丢�
 | 场景 / 实现 | 队列策略 | 刷新策略 | 生产者吞吐量（万条/秒） | 端到端吞吐量（万条/秒） | 丢弃率 |
 | --- | --- | --- | ---: | ---: | ---: |
 | 可靠 / 周期刷新（cpp_logger） | Block | Periodic 1 s | 103.37 | 102.60 | 0.0000% |
-| 可靠 / 周期刷新（spdlog v1.17.0） | Block | Periodic 1 s | 10.43 | 10.42 | 0.0000% |
+| 可靠 / 周期刷新（spdlog v1.17.0，MSVC） | Block | Periodic 1 s | 33.91 | 33.83 | 0.0000% |
 | 可靠 / 周期刷新（Quill） | UnboundedBlocking | Periodic 1 s | 943.82 | 73.11 | 0.0000% |
 | 容忍丢失 / 丢新（cpp_logger） | DropNewest | Periodic 1 s | 230.12 | 103.53 | 54.2425% |
-| 容忍丢失 / 丢新（spdlog v1.17.0） | DiscardNew | Periodic 1 s | 409.37 | 25.31 | 93.6654% |
+| 容忍丢失 / 丢新（spdlog v1.17.0，MSVC） | DiscardNew | Periodic 1 s | 428.28 | 47.40 | 88.6532% |
 | 容忍丢失 / 丢新（Quill） | BoundedDropping | Periodic 1 s | 5906.90 | 65.62 | 97.8928% |
 
 #### 16 个生产者
@@ -293,16 +293,16 @@ Quill 要求同一线程只使用一种 `FrontendOptions`，所以可靠与丢�
 | 场景 / 实现 | 队列策略 | 刷新策略 | 生产者吞吐量（万条/秒） | 端到端吞吐量（万条/秒） | 丢弃率 |
 | --- | --- | --- | ---: | ---: | ---: |
 | 可靠 / 周期刷新（cpp_logger） | Block | Periodic 1 s | 72.30 | 71.62 | 0.0000% |
-| 可靠 / 周期刷新（spdlog v1.17.0） | Block | Periodic 1 s | 9.27 | 9.27 | 0.0000% |
+| 可靠 / 周期刷新（spdlog v1.17.0，MSVC） | Block | Periodic 1 s | 33.77 | 33.70 | 0.0000% |
 | 可靠 / 周期刷新（Quill） | UnboundedBlocking | Periodic 1 s | 843.36 | 68.28 | 0.0000% |
 | 容忍丢失 / 丢新（cpp_logger） | DropNewest | Periodic 1 s | 123.35 | 36.84 | 69.7742% |
-| 容忍丢失 / 丢新（spdlog v1.17.0） | DiscardNew | Periodic 1 s | 451.18 | 18.22 | 95.8711% |
+| 容忍丢失 / 丢新（spdlog v1.17.0，MSVC） | DiscardNew | Periodic 1 s | 463.51 | 26.23 | 94.1834% |
 | 容忍丢失 / 丢新（Quill） | BoundedDropping | Periodic 1 s | 6194.27 | 46.62 | 98.3951% |
 
 结果分析：
 
-- 三个可靠 Profile 均无丢失。Quill 的前端提交速率显著更高，反映其每生产者 SPSC 队列和延后格式化的设计；本机的真实文本文件落盘指标中，`cpp_logger` 高于此处固定为全局队列、单工作线程的 spdlog 配置。三者优化路径不同，不能只用其中一个指标下结论。
-- 丢新模式下，Quill 与 spdlog 的提交速率很高，但分别有约 90%–97% 以上记录被拒绝；这些数字不是可靠写入能力。`cpp_logger` 的丢弃率较低，端到端吞吐仍需结合保留量和业务可接受的丢失上限判断。
+- 三个可靠 Profile 均无丢失。spdlog 的 MSVC 数据使用全局 MPMC 队列和单工作线程；cpp_logger、Quill 行则来自 MinGW。编译器、标准库与文件 I/O 实现均会影响结果，因此它们不能作为严格的跨库吞吐排名。
+- 丢新模式下，Quill 与 spdlog 的提交速率很高，但分别有约 82.8%–97% 以上记录被拒绝；这些数字不是可靠写入能力。端到端吞吐应结合最终保留量和业务可接受的丢失上限判断。
 - spdlog 的异步队列、Quill 的每生产者 SPSC 队列、各自的格式化器和文件 Sink 都与本项目不同；这组数据只描述上述具体配置，不是跨平台、跨编译器、跨存储介质的通用库排名。
 - `DropOldest` 继续由本项目的单元测试覆盖。spdlog 的 `OverrunOldest` 虽属相近语义，但由于本轮没有重跑对应的 `cpp_logger::DropOldest` 数据，未放入表中，避免用不同时次的数据做横向结论。
 
