@@ -7,12 +7,12 @@
 English | [简体中文](README.md)
 
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=c%2B%2B)
-[![CI](https://github.com/qxf-72/cpp_logger/actions/workflows/ci.yml/badge.svg)](https://github.com/qxf-72/cpp_logger/actions/workflows/ci.yml)
-![Release](https://img.shields.io/github/v/release/qxf-72/cpp_logger?display_name=tag&logo=github)
 ![CMake](https://img.shields.io/badge/CMake-3.14%2B-064F8C?logo=cmake)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-555555?logo=linux&logoColor=FCC624)
-![Stars](https://img.shields.io/github/stars/qxf-72/cpp_logger?logo=github&label=stars&color=F5C518)
+[![CI](https://github.com/qxf-72/cpp_logger/actions/workflows/ci.yml/badge.svg)](https://github.com/qxf-72/cpp_logger/actions/workflows/ci.yml)
+![Release](https://img.shields.io/github/v/release/qxf-72/cpp_logger?display_name=tag&logo=github)
 [![License](https://img.shields.io/github/license/qxf-72/cpp_logger?color=yellow)](LICENSE)
+![Stars](https://img.shields.io/github/stars/qxf-72/cpp_logger?logo=github&label=stars&color=F5C518)
 
 </div>
 
