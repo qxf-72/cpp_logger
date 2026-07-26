@@ -91,7 +91,9 @@ target_link_libraries(logger_demo PRIVATE
 )
 
 option(LOGGER_BUILD_BENCHMARK "Build the logger performance benchmark" ON)
-option(LOGGER_BUILD_SPDLOG_BENCHMARK "Build the cpp_logger versus spdlog benchmark" OFF)
+option(LOGGER_BUILD_QUILL_BENCHMARK "Build the cpp_logger versus Quill benchmark" OFF)
+option(LOGGER_FETCH_QUILL "Fetch the pinned Quill dependency when it is not installed" OFF)
+option(LOGGER_BUILD_SPDLOG_BENCHMARK "Build the standalone spdlog comparison benchmark" OFF)
 option(LOGGER_FETCH_SPDLOG "Fetch the pinned spdlog dependency when it is not installed" OFF)
 
 if(LOGGER_BUILD_BENCHMARK)
@@ -105,13 +107,15 @@ if(LOGGER_BUILD_BENCHMARK)
 endif()
 
 if(LOGGER_BUILD_SPDLOG_BENCHMARK)
-    find_package(spdlog CONFIG QUIET)
+    # spdlog 固定为 v1.17.0，且使用其 header-only 目标；这样基准的依赖构建方式可复现，
+    # 不会把系统已安装静态库的编译选项混入测量结果。
+    find_package(spdlog 1.17.0 EXACT CONFIG QUIET)
 
-    if(NOT TARGET spdlog::spdlog AND NOT TARGET spdlog::spdlog_header_only)
+    if(NOT TARGET spdlog::spdlog_header_only)
         if(NOT LOGGER_FETCH_SPDLOG)
             message(FATAL_ERROR
-                "spdlog is required for logger_spdlog_benchmark. Install it, or configure with "
-                "-DLOGGER_FETCH_SPDLOG=ON to fetch the pinned v1.17.0 dependency.")
+                "spdlog v1.17.0 is required for the standalone benchmark. Install it, or configure with "
+                "-DLOGGER_FETCH_SPDLOG=ON to fetch the pinned dependency.")
         endif()
 
         include(FetchContent)
@@ -119,6 +123,7 @@ if(LOGGER_BUILD_SPDLOG_BENCHMARK)
         set(SPDLOG_BUILD_TESTS OFF CACHE BOOL "" FORCE)
         set(SPDLOG_BUILD_BENCH OFF CACHE BOOL "" FORCE)
         set(SPDLOG_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+        set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
         FetchContent_Declare(
             spdlog
             GIT_REPOSITORY https://github.com/gabime/spdlog.git
@@ -128,21 +133,71 @@ if(LOGGER_BUILD_SPDLOG_BENCHMARK)
         FetchContent_MakeAvailable(spdlog)
     endif()
 
-    if(TARGET spdlog::spdlog_header_only)
-        set(LOGGER_SPDLOG_TARGET spdlog::spdlog_header_only)
-    elseif(TARGET spdlog::spdlog)
-        set(LOGGER_SPDLOG_TARGET spdlog::spdlog)
-    else()
-        message(FATAL_ERROR "spdlog was found but did not export a supported CMake target")
+    if(NOT TARGET spdlog::spdlog_header_only)
+        message(FATAL_ERROR "spdlog was found but did not export spdlog::spdlog_header_only")
     endif()
 
     add_executable(logger_spdlog_benchmark
+        benchmark/spdlog_benchmark.cpp
+    )
+    target_link_libraries(logger_spdlog_benchmark PRIVATE
+        spdlog::spdlog_header_only
+    )
+endif()
+
+if(LOGGER_BUILD_QUILL_BENCHMARK)
+    # 对照基准固定 Quill 版本，使不同运行环境的结果可追溯。
+    find_package(quill 9.0.3 EXACT CONFIG QUIET)
+
+    if(NOT TARGET quill::quill)
+        if(NOT LOGGER_FETCH_QUILL)
+            message(FATAL_ERROR
+                "Quill is required for the logger Quill benchmark targets. Install it, or configure with "
+                "-DLOGGER_FETCH_QUILL=ON to fetch the pinned v9.0.3 dependency.")
+        endif()
+
+        include(FetchContent)
+        set(QUILL_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+        set(QUILL_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(QUILL_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+        # 避免 Quill 的 LOG_INFO 宏与项目对外提供的日志宏重名。
+        set(QUILL_DISABLE_NON_PREFIXED_MACROS ON CACHE BOOL "" FORCE)
+        # Quill v9 在 MinGW 环境下启用线程名称支持时，线程局部资源的清理会触发已知兼容性问题；
+        # 对比程序不依赖线程名称，因此在该工具链下关闭它。
+        if(MINGW)
+            set(QUILL_NO_THREAD_NAME_SUPPORT ON CACHE BOOL "" FORCE)
+        endif()
+        FetchContent_Declare(
+            quill
+            GIT_REPOSITORY https://github.com/odygrd/quill.git
+            GIT_TAG v9.0.3
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(quill)
+    endif()
+
+    if(NOT TARGET quill::quill)
+        message(FATAL_ERROR "Quill was found but did not export quill::quill")
+    endif()
+
+    # Quill 约束同一线程只能使用一种 FrontendOptions；阻塞与丢新分别构建为独立可执行程序，
+    # 避免两种队列类型在主线程的 flush 阶段混用。
+    add_executable(logger_quill_blocking_benchmark
         benchmark/comparison_benchmark.cpp
     )
-
-    target_link_libraries(logger_spdlog_benchmark PRIVATE
+    target_compile_definitions(logger_quill_blocking_benchmark PRIVATE LOGGER_QUILL_QUEUE_MODE=1)
+    target_link_libraries(logger_quill_blocking_benchmark PRIVATE
         logger
-        ${LOGGER_SPDLOG_TARGET}
+        quill::quill
+    )
+
+    add_executable(logger_quill_dropping_benchmark
+        benchmark/comparison_benchmark.cpp
+    )
+    target_compile_definitions(logger_quill_dropping_benchmark PRIVATE LOGGER_QUILL_QUEUE_MODE=2)
+    target_link_libraries(logger_quill_dropping_benchmark PRIVATE
+        logger
+        quill::quill
     )
 endif()
 

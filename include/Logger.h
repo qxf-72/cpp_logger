@@ -19,7 +19,7 @@
 #include "LogSink.h"
 
 // Windows SDK headers define ERROR as a macro. The public LogLevel::ERROR spelling must remain
-// usable even when a consumer includes those headers (or spdlog) before Logger.h.
+// usable even when a consumer includes Windows SDK headers before Logger.h.
 #ifdef ERROR
 #undef ERROR
 #endif
