@@ -7,6 +7,8 @@
 #include <functional>
 #include <future>
 #include <iostream>
+#include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -57,6 +59,55 @@ class TemporaryDirectory {
 
  private:
   fs::path path_;
+};
+
+class StreamBufferRedirect {
+ public:
+  StreamBufferRedirect(std::ostream& stream, std::streambuf* replacement)
+      : stream_(stream), original_(stream.rdbuf(replacement)) {}
+
+  ~StreamBufferRedirect() {
+    stream_.rdbuf(original_);
+  }
+
+  StreamBufferRedirect(const StreamBufferRedirect&) = delete;
+  StreamBufferRedirect& operator=(const StreamBufferRedirect&) = delete;
+
+ private:
+  std::ostream& stream_;
+  std::streambuf* original_;
+};
+
+class MemorySink final : public LogSink {
+ public:
+  void writeBatch(const Batch& records) override {
+    received_.insert(received_.end(), records.begin(), records.end());
+  }
+
+  void flush() override {
+    ++flushCount_;
+  }
+
+  void close() noexcept override {
+    closed_ = true;
+  }
+
+  const std::vector<std::string>& received() const noexcept {
+    return received_;
+  }
+
+  std::size_t flushCount() const noexcept {
+    return flushCount_;
+  }
+
+  bool closed() const noexcept {
+    return closed_;
+  }
+
+ private:
+  std::vector<std::string> received_;
+  std::size_t flushCount_{0};
+  bool closed_{false};
 };
 
 std::vector<fs::path> logFiles(const fs::path& directory) {
@@ -269,6 +320,69 @@ void testInitializationValidationAndDirectoryCreation() {
   config.flushPolicy = FlushPolicy::Periodic;
   config.flushInterval = std::chrono::milliseconds::zero();
   CHECK(!logger.init(config));
+
+  config.flushInterval = std::chrono::milliseconds(1);
+  config.enableFileSink = false;
+  config.enableConsoleSink = false;
+  CHECK(!logger.init(config));
+}
+
+void testConsoleAndCustomSinks() {
+  auto& logger = Logger::instance();
+  logger.stop();
+
+  TemporaryDirectory temporaryDirectory("multiple_sinks");
+  std::ostringstream consoleOutput;
+  {
+    // Logger 的后台线程结束前保持重定向有效，避免恢复缓冲区后仍写入旧指针。
+    StreamBufferRedirect redirect(std::cout, consoleOutput.rdbuf());
+    LoggerConfig config;
+    config.basePath = temporaryDirectory.path() / "app";
+    config.enableConsoleSink = true;
+    config.consoleStream = ConsoleStream::Stdout;
+    config.flushPolicy = FlushPolicy::OnStop;
+    config.flushAtOrAbove = std::nullopt;
+    CHECK(logger.init(config));
+    LOG_INFO("file-and-console-message");
+    logger.stop();
+  }
+
+  CHECK(consoleOutput.str().find("file-and-console-message") != std::string::npos);
+  CHECK(readAllLogs(temporaryDirectory.path()).find("file-and-console-message") !=
+        std::string::npos);
+
+  std::ostringstream errorOutput;
+  {
+    // 仅启用控制台时无需提供 basePath；同时验证 Stderr 输出目标。
+    StreamBufferRedirect redirect(std::cerr, errorOutput.rdbuf());
+    LoggerConfig consoleOnlyConfig;
+    consoleOnlyConfig.enableFileSink = false;
+    consoleOnlyConfig.enableConsoleSink = true;
+    consoleOnlyConfig.consoleStream = ConsoleStream::Stderr;
+    consoleOnlyConfig.flushPolicy = FlushPolicy::OnStop;
+    consoleOnlyConfig.flushAtOrAbove = std::nullopt;
+    CHECK(logger.init(consoleOnlyConfig));
+    LOG_ERROR("stderr-only-message");
+    logger.stop();
+  }
+
+  CHECK(errorOutput.str().find("stderr-only-message") != std::string::npos);
+
+  const auto memorySink = std::make_shared<MemorySink>();
+  LoggerConfig customConfig;
+  customConfig.enableFileSink = false;
+  customConfig.enableConsoleSink = false;
+  customConfig.additionalSinks.push_back(memorySink);
+  customConfig.flushPolicy = FlushPolicy::OnStop;
+  customConfig.flushAtOrAbove = std::nullopt;
+  CHECK(logger.init(customConfig));
+  LOG_WARN("custom-sink-message");
+  logger.stop();
+
+  CHECK(memorySink->received().size() == 1);
+  CHECK(memorySink->received().front().find("custom-sink-message") != std::string::npos);
+  CHECK(memorySink->flushCount() >= 1);
+  CHECK(memorySink->closed());
 }
 
 void testPeriodicFlushAndFileOwnership() {
@@ -484,6 +598,7 @@ int main() {
       {"queue overflow policies and statistics", testQueueOverflowPoliciesAndStats},
       {"initialization validation and directory creation",
        testInitializationValidationAndDirectoryCreation},
+      {"console and custom sinks", testConsoleAndCustomSinks},
       {"periodic flush and file ownership", testPeriodicFlushAndFileOwnership},
       {"binary output uses byte-accurate newlines", testBinaryOutputUsesByteAccurateNewlines},
       {"level-triggered flush", testLevelTriggeredFlush},

@@ -7,12 +7,14 @@
 #include "Logger.h"
 
 int main() {
-  // 使用配置结构统一设置文件滚动、队列容量和队列满时的处理方式。
+  // 使用配置结构统一设置文件滚动、队列容量、队列满时策略和输出端。
   LoggerConfig config;
   config.basePath = "logs/app";
   config.minLevel = LogLevel::DEBUG;
   config.queueCapacity = 8192;
   config.overflowPolicy = OverflowPolicy::Block;
+  config.enableConsoleSink = false;
+  config.consoleStream = ConsoleStream::Stdout;
   if (!Logger::instance().init(config)) {
     std::cerr << "failed to initialize logger\n";
     return 1;

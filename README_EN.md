@@ -22,12 +22,13 @@ English | [简体中文](README.md)
 
 | Capability | Details |
 | --- | --- |
-| Asynchronous writing | Application threads submit `LogRecord` objects; the background thread formats, rotates, and writes files. |
+| Asynchronous writing | Application threads submit `LogRecord` objects; the background thread formats, rotates, and dispatches them to sinks. |
 | Bounded queue | `Block`, `DropNewest`, and `DropOldest` policies are available when the queue is full. |
 | Batch processing | Records are popped, formatted, and written in batches to reduce synchronization and stream overhead. |
 | Observability | `droppedCount()`, `queueSize()`, and `queuePeakSize()` expose queue state. |
 | Log management | Five levels, millisecond timestamps, thread IDs, source locations, and date/size rotation. |
 | Shutdown and flushing | On-stop, periodic, and per-batch flushing; `stop()` drains accepted records. |
+| Multiple sinks | Built-in rotating `FileSink` and `ConsoleSink`, plus custom `LogSink` support. |
 | Tooling | CTest, cross-platform GitHub Actions CI, and `find_package` package export. |
 
 ## 🚀 Quick Start
@@ -80,6 +81,8 @@ int main() {
   config.flushPolicy = FlushPolicy::Periodic;
   config.flushInterval = std::chrono::seconds(1);
   config.flushAtOrAbove = LogLevel::ERROR;
+  config.enableConsoleSink = true;
+  config.consoleStream = ConsoleStream::Stdout;
 
   if (!Logger::instance().init(config)) {
     return 1;
@@ -118,7 +121,19 @@ The original `init("app", LogLevel::DEBUG, 10 * 1024 * 1024)` overload remains a
 | `FlushPolicy::Periodic` | Flushes at `flushInterval`, one second by default; this is the default policy. |
 | `FlushPolicy::EveryBatch` | Flushes after every writer batch, improving visibility at a higher cost. |
 
-`flushAtOrAbove` defaults to `LogLevel::ERROR`; set it to `std::nullopt` to disable level-triggered flushes. `std::ofstream::flush()` flushes the C++ stream to the operating system, but is not `fsync` and does not provide power-loss durability.
+`flushAtOrAbove` defaults to `LogLevel::ERROR`; set it to `std::nullopt` to disable level-triggered flushes. The `std::ofstream::flush()` used by `FileSink` flushes the C++ stream to the operating system, but is not `fsync` and does not provide power-loss durability.
+
+### Output Sinks
+
+`FileSink` is enabled by default and handles date/size rotation. `ConsoleSink` is optional and writes to standard output or standard error. Both built-in sinks can be enabled together and receive the same formatted batch:
+
+```cpp
+config.enableFileSink = true;               // Default; basePath is required when enabled.
+config.enableConsoleSink = true;
+config.consoleStream = ConsoleStream::Stderr;
+```
+
+When the file sink is disabled, `basePath` is no longer required and the logger can use only the console or custom sinks. Derive a custom sink from `LogSink` and add it to `additionalSinks`; its `writeBatch()`, `flush()`, and `close()` methods are all called by the background logger thread.
 
 ## 🏗️ Core Data Flow
 
@@ -128,8 +143,8 @@ flowchart LR
     R --> Q[Bounded BlockingQueue]
     Q --> W[Background logger thread]
     W --> F[Format a batch]
-    F --> O[Date/size rotation]
-    O --> D[Write a batch to file]
+    F --> S[FileSink / ConsoleSink / custom sink]
+    S --> D[Write a batch]
 ```
 
 - Application threads capture the timestamp, level, thread ID, source location, and message, then enqueue the record; string formatting is deferred to the background thread.
@@ -237,7 +252,7 @@ The compared modes use one asynchronous writer, an 8192-record queue, the same p
 
 ## 🗺️ Roadmap
 
-- [ ] Console and pluggable output sinks
+- [x] Console and pluggable output sinks
 - [ ] Log-retention and automatic-cleanup policies
 - [ ] More CI checks, including formatting and static analysis
 

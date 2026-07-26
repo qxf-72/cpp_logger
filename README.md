@@ -22,12 +22,13 @@
 
 | 能力 | 说明 |
 | --- | --- |
-| 异步写入 | 业务线程提交 `LogRecord`；后台线程负责格式化、滚动和文件 I/O。 |
+| 异步写入 | 业务线程提交 `LogRecord`；后台线程负责格式化、滚动和分发至输出端。 |
 | 有界队列 | 支持 `Block`、`DropNewest`、`DropOldest` 三种队列满策略。 |
 | 批量处理 | 按批出队、格式化和写入，减少同步与流写入次数。 |
 | 可观测性 | 提供 `droppedCount()`、`queueSize()` 与 `queuePeakSize()`。 |
 | 日志管理 | 五级过滤、毫秒时间戳、线程 ID、源文件位置、按日期/大小滚动。 |
 | 刷新与停止 | 支持停止时、定时、每批刷新；`stop()` 会排空已接收的日志。 |
+| 多输出端 | 内置滚动 `FileSink` 与 `ConsoleSink`，也可接入自定义 `LogSink`。 |
 | 工程化 | 支持 CTest、跨平台 GitHub Actions CI、`find_package` 包导出。 |
 
 ## 🚀 快速开始
@@ -80,6 +81,8 @@ int main() {
   config.flushPolicy = FlushPolicy::Periodic;
   config.flushInterval = std::chrono::seconds(1);
   config.flushAtOrAbove = LogLevel::ERROR;
+  config.enableConsoleSink = true;
+  config.consoleStream = ConsoleStream::Stdout;
 
   if (!Logger::instance().init(config)) {
     return 1;
@@ -118,7 +121,19 @@ int main() {
 | `FlushPolicy::Periodic` | 按 `flushInterval` 定时刷新，默认 1 秒；也是默认策略。 |
 | `FlushPolicy::EveryBatch` | 每个写入批次后刷新，日志可见性更快但开销更高。 |
 
-`flushAtOrAbove` 默认是 `LogLevel::ERROR`；设置为 `std::nullopt` 可关闭按级别刷新。这里的 `std::ofstream::flush()` 将 C++ 流缓冲刷新到操作系统，并不等同于 `fsync`，因此不提供断电安全的持久化保证。
+`flushAtOrAbove` 默认是 `LogLevel::ERROR`；设置为 `std::nullopt` 可关闭按级别刷新。这里的 `FileSink` 使用的 `std::ofstream::flush()` 将 C++ 流缓冲刷新到操作系统，并不等同于 `fsync`，因此不提供断电安全的持久化保证。
+
+### 输出端（Sink）
+
+`FileSink` 默认启用，负责按日期和大小滚动文件；`ConsoleSink` 可选，并可写入标准输出或标准错误。两个内置 Sink 可同时启用，接收同一批格式化日志：
+
+```cpp
+config.enableFileSink = true;               // 默认值；启用时 basePath 必填
+config.enableConsoleSink = true;
+config.consoleStream = ConsoleStream::Stderr;
+```
+
+关闭文件输出后，可以仅使用控制台或自定义输出端，此时 `basePath` 不再必填。自定义 Sink 继承 `LogSink` 并放入 `additionalSinks`；其 `writeBatch()`、`flush()` 和 `close()` 均由日志后台线程调用。
 
 ## 🏗️ 核心数据流
 
@@ -128,8 +143,8 @@ flowchart LR
     R --> Q[有界 BlockingQueue]
     Q --> W[后台日志线程]
     W --> F[批量格式化]
-    F --> O[按日期/大小滚动]
-    O --> D[批量写入日志文件]
+    F --> S[FileSink / ConsoleSink / 自定义 Sink]
+    S --> D[批量输出]
 ```
 
 - 业务线程采集时间、级别、线程 ID、源位置与消息后入队；字符串格式化延后到后台线程。
@@ -237,7 +252,7 @@ cmake --build build-spdlog --parallel
 
 ## 🗺️ 后续计划
 
-- [ ] 支持控制台与可插拔输出端
+- [x] 支持控制台与可插拔输出端
 - [ ] 支持日志文件保留期与自动清理
 - [ ] 补充更多持续集成检查（格式化、静态分析）
 

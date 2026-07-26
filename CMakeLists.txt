@@ -14,6 +14,7 @@ include(GNUInstallDirs)
 
 # 生成静态库
 add_library(logger STATIC
+    src/LogSink.cpp
     src/Logger.cpp
 )
 

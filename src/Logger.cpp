@@ -5,9 +5,7 @@
 #include <ctime>
 #include <functional>
 #include <iostream>
-#include <limits>
 #include <stdexcept>
-#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -57,6 +55,15 @@ bool isValidFlushPolicy(FlushPolicy policy) noexcept {
   return false;
 }
 
+bool isValidConsoleStream(ConsoleStream stream) noexcept {
+  switch (stream) {
+    case ConsoleStream::Stdout:
+    case ConsoleStream::Stderr:
+      return true;
+  }
+  return false;
+}
+
 template <typename Integer>
 void appendInteger(std::string& destination, Integer value) {
   char buffer[32];
@@ -88,56 +95,64 @@ bool Logger::init(const fs::path& basePath, LogLevel minLevel, std::size_t maxFi
 bool Logger::init(const LoggerConfig& config) {
   // 独占生命周期锁后，已有的 log() 调用会完成，新的调用会等待本次初始化结束。
   std::unique_lock lock(lifecycleMutex_);
-  if (running_.load(std::memory_order_acquire) || config.basePath.empty() ||
-      config.maxFileSize == 0 || config.queueCapacity == 0 || config.writeBatchSize == 0 ||
-      !isValidLogLevel(config.minLevel) || !isValidOverflowPolicy(config.overflowPolicy) ||
-      !isValidFlushPolicy(config.flushPolicy) ||
+  if (running_.load(std::memory_order_acquire) || config.queueCapacity == 0 ||
+      config.writeBatchSize == 0 || !isValidLogLevel(config.minLevel) ||
+      !isValidOverflowPolicy(config.overflowPolicy) || !isValidFlushPolicy(config.flushPolicy) ||
       (config.flushPolicy == FlushPolicy::Periodic && config.flushInterval.count() <= 0) ||
-      (config.flushAtOrAbove.has_value() && !isValidLogLevel(*config.flushAtOrAbove))) {
+      (config.flushAtOrAbove.has_value() && !isValidLogLevel(*config.flushAtOrAbove)) ||
+      !isValidConsoleStream(config.consoleStream) ||
+      (!config.enableFileSink && !config.enableConsoleSink && config.additionalSinks.empty()) ||
+      (config.enableFileSink && (config.basePath.empty() || config.maxFileSize == 0))) {
     return false;
+  }
+
+  for (const std::shared_ptr<LogSink>& sink : config.additionalSinks) {
+    if (!sink) {
+      return false;
+    }
   }
 
   if (worker_.joinable()) {
     worker_.join();
   }
 
-  const fs::path parentPath = config.basePath.parent_path();
-  if (!parentPath.empty()) {
-    // 允许调用方直接使用尚未创建的日志目录。
-    std::error_code error;
-    fs::create_directories(parentPath, error);
-    if (error) {
-      std::cerr << "logger init failed: unable to create directory '" << parentPath.string()
-                << "': " << error.message() << '\n';
-      return false;
+  closeSinks();
+  sinks_.clear();
+
+  std::vector<std::shared_ptr<LogSink>> newSinks;
+  try {
+    if (config.enableFileSink) {
+      newSinks.push_back(
+          detail::makeFileSink(config.basePath, config.maxFileSize, config.writeBatchSize));
     }
+    if (config.enableConsoleSink) {
+      newSinks.push_back(detail::makeConsoleSink(config.consoleStream, config.writeBatchSize));
+    }
+    newSinks.insert(newSinks.end(), config.additionalSinks.begin(), config.additionalSinks.end());
+  } catch (const std::exception& error) {
+    std::cerr << "logger init failed: " << error.what() << '\n';
+    return false;
   }
 
   // stop() 会关闭队列；重新初始化前必须恢复其可写状态并应用新的容量和策略。
   queue_.reset(config.queueCapacity, config.overflowPolicy);
   minLevel_.store(static_cast<int>(config.minLevel), std::memory_order_release);
-  basePath_ = config.basePath;
-  maxFileSize_ = config.maxFileSize;
   writeBatchSize_ = config.writeBatchSize;
   flushPolicy_ = config.flushPolicy;
   flushInterval_ = config.flushInterval;
   flushAtOrAbove_ = config.flushAtOrAbove;
-  currentDate_ = currentDate();
   hasCachedTimestampPrefix_ = false;
   cachedTimestampPrefix_.clear();
-  currentSize_ = 0;
-  fileIndex_ = 0;
+  sinks_ = std::move(newSinks);
 
   try {
-    openNewLogFile();
     running_.store(true, std::memory_order_release);
     worker_ = std::thread(&Logger::workerLoop, this);
   } catch (const std::exception& error) {
     running_.store(false, std::memory_order_release);
     queue_.close();
-    if (out_.is_open()) {
-      out_.close();
-    }
+    closeSinks();
+    sinks_.clear();
     std::cerr << "logger init failed: " << error.what() << '\n';
     return false;
   }
@@ -200,10 +215,8 @@ void Logger::stop() {
     worker_.join();
   }
 
-  if (out_.is_open()) {
-    out_.flush();
-    out_.close();
-  }
+  closeSinks();
+  sinks_.clear();
 }
 
 std::uint64_t Logger::droppedCount() const {
@@ -222,12 +235,8 @@ void Logger::workerLoop() {
   try {
     std::vector<LogRecord> batch;
     batch.reserve(writeBatchSize_);
-    std::string pending;
-    constexpr std::size_t kEstimatedFormattedRecordSize = 256;
-    if (writeBatchSize_ <=
-        std::numeric_limits<std::size_t>::max() / kEstimatedFormattedRecordSize) {
-      pending.reserve(writeBatchSize_ * kEstimatedFormattedRecordSize);
-    }
+    LogSink::Batch formattedBatch;
+    formattedBatch.reserve(writeBatchSize_);
     auto nextFlush = std::chrono::steady_clock::now() + flushInterval_;
 
     while (true) {
@@ -246,7 +255,7 @@ void Logger::workerLoop() {
       if (!hasBatch) {
         if (flushPolicy_ == FlushPolicy::Periodic &&
             std::chrono::steady_clock::now() >= nextFlush) {
-          flushOutput();
+          flushSinks();
           nextFlush = std::chrono::steady_clock::now() + flushInterval_;
         }
         if (queue_.closed()) {
@@ -256,25 +265,23 @@ void Logger::workerLoop() {
       }
 
       bool flushForLevel = false;
+      formattedBatch.clear();
       for (const LogRecord& record : batch) {
-        const std::string message = formatMessage(record);
-        // 只有后台线程会修改文件状态，因此滚动逻辑不需要额外加锁。若需要滚动，
-        // rollIfNeeded 会先写入 pending，确保旧文件不会遗失本批已经格式化的内容。
-        rollIfNeeded(message, pending);
-        pending += message;
-        pending += '\n';
-        currentSize_ += message.size() + 1;
+        formattedBatch.push_back(formatMessage(record));
         flushForLevel =
             flushForLevel || (flushAtOrAbove_.has_value() &&
                               static_cast<int>(record.level) >= static_cast<int>(*flushAtOrAbove_));
       }
 
-      // 每批只执行一次 stream::write()；flush 的时机由策略控制。
-      flushPending(pending);
+      // 每个 Sink 都接收同一批格式化记录；FileSink 内部仍按记录判断滚动边界。
+      for (const std::shared_ptr<LogSink>& sink : sinks_) {
+        sink->writeBatch(formattedBatch);
+      }
+
       const bool periodicFlush =
           flushPolicy_ == FlushPolicy::Periodic && std::chrono::steady_clock::now() >= nextFlush;
       if (flushPolicy_ == FlushPolicy::EveryBatch || flushForLevel || periodicFlush) {
-        flushOutput();
+        flushSinks();
         if (flushPolicy_ == FlushPolicy::Periodic) {
           nextFlush = std::chrono::steady_clock::now() + flushInterval_;
         }
@@ -286,11 +293,26 @@ void Logger::workerLoop() {
     queue_.close();
   }
 
-  if (out_.is_open()) {
-    out_.flush();
-    if (!out_) {
-      std::cerr << "logger worker failed: unable to flush log file\n";
-      running_.store(false, std::memory_order_release);
+  try {
+    // 无论是正常排空还是异常退出，都尽力刷新已经成功交给 Sink 的记录。
+    flushSinks();
+  } catch (const std::exception& error) {
+    std::cerr << "logger worker failed while flushing sinks: " << error.what() << '\n';
+    running_.store(false, std::memory_order_release);
+    queue_.close();
+  }
+}
+
+void Logger::flushSinks() {
+  for (const std::shared_ptr<LogSink>& sink : sinks_) {
+    sink->flush();
+  }
+}
+
+void Logger::closeSinks() noexcept {
+  for (const std::shared_ptr<LogSink>& sink : sinks_) {
+    if (sink) {
+      sink->close();
     }
   }
 }
@@ -359,88 +381,4 @@ std::string Logger::formatTime(std::chrono::system_clock::time_point timestamp) 
   }
   appendInteger(formatted, milliseconds.count());
   return formatted;
-}
-
-std::string Logger::currentDate() {
-  const auto time = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
-  const std::tm localTime = toLocalTime(time);
-
-  char buffer[16];
-  std::strftime(buffer, sizeof(buffer), "%Y-%m-%d", &localTime);
-  return buffer;
-}
-
-fs::path Logger::makeLogFileName() const {
-  // 保留 basePath 的父目录，只对最后的文件名前缀追加日期和序号。
-  const std::string filename = basePath_.filename().string() + '_' + currentDate_ + '_' +
-                               std::to_string(fileIndex_) + ".log";
-  return basePath_.parent_path() / filename;
-}
-
-std::size_t Logger::fileSize(const fs::path& filename) {
-  // 文件不存在时 file_size 会通过 error_code 返回错误，此处按新文件的大小 0 处理。
-  std::error_code error;
-  const auto size = fs::file_size(filename, error);
-  return error ? 0 : static_cast<std::size_t>(size);
-}
-
-void Logger::openNewLogFile() {
-  const fs::path filename = makeLogFileName();
-  const std::size_t existingSize = fileSize(filename);
-  // 二进制模式保证 '\n' 始终只占一个字节，让 currentSize_ 与文件实际大小一致。
-  std::ofstream next(filename, std::ios::out | std::ios::app | std::ios::binary);
-  if (!next.is_open()) {
-    throw std::runtime_error("unable to open log file: " + filename.string());
-  }
-
-  if (out_.is_open()) {
-    // 新文件已成功打开后才关闭旧文件，避免滚动失败时失去当前输出目标。
-    out_.flush();
-    if (!out_) {
-      throw std::runtime_error("unable to flush current log file");
-    }
-    out_.close();
-  }
-
-  out_ = std::move(next);
-  currentSize_ = existingSize;
-}
-
-void Logger::flushPending(std::string& pending) {
-  if (pending.empty()) {
-    return;
-  }
-
-  out_.write(pending.data(), static_cast<std::streamsize>(pending.size()));
-  if (!out_) {
-    throw std::runtime_error("failed to write log batch");
-  }
-  pending.clear();
-}
-
-void Logger::flushOutput() {
-  out_.flush();
-  if (!out_) {
-    throw std::runtime_error("failed to flush log file");
-  }
-}
-
-void Logger::rollIfNeeded(std::string_view message, std::string& pending) {
-  const std::string today = currentDate();
-  if (today != currentDate_) {
-    // 日期变更时从新日期的 0 号文件重新开始。
-    flushPending(pending);
-    currentDate_ = today;
-    fileIndex_ = 0;
-    openNewLogFile();
-  }
-
-  const std::size_t appendSize = message.size() + 1;
-  // 单条超大日志允许写入空文件，避免反复滚动却无法写入。
-  while (currentSize_ > 0 &&
-         (appendSize > maxFileSize_ || currentSize_ > maxFileSize_ - appendSize)) {
-    flushPending(pending);
-    ++fileIndex_;
-    openNewLogFile();
-  }
 }

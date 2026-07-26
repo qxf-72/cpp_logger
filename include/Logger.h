@@ -7,14 +7,16 @@
 #include <cstdint>
 #include <ctime>
 #include <filesystem>
-#include <fstream>
+#include <memory>
 #include <optional>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "BlockingQueue.h"
+#include "LogSink.h"
 
 // Windows SDK headers define ERROR as a macro. The public LogLevel::ERROR spelling must remain
 // usable even when a consumer includes those headers (or spdlog) before Logger.h.
@@ -44,6 +46,14 @@ struct LoggerConfig {
   std::chrono::milliseconds flushInterval{kDefaultFlushInterval};
   // 非空时，后台线程处理到该级别及以上的记录后会在本批内刷新。
   std::optional<LogLevel> flushAtOrAbove{LogLevel::ERROR};
+
+  // 默认写入滚动文件；关闭后 basePath 与 maxFileSize 不再是必填项。
+  bool enableFileSink{true};
+  // 控制台 Sink 与文件 Sink 可同时启用，二者接收同一批格式化记录。
+  bool enableConsoleSink{false};
+  ConsoleStream consoleStream{ConsoleStream::Stdout};
+  // 用户自定义 Sink 也由 Logger 的后台线程调用；Logger 会在 stop() 时调用 close()。
+  std::vector<std::shared_ptr<LogSink>> additionalSinks;
 };
 
 class Logger {
@@ -96,40 +106,29 @@ class Logger {
   Logger() = default;
   ~Logger();
 
-  // 后台线程负责消费队列、处理滚动并写入文件。
+  // 后台线程负责消费队列、格式化记录并分发给全部 Sink。
   void logImpl(LogLevel level, const char* file, int line, std::string_view message,
                bool fileHasStaticStorage);
   void workerLoop();
   std::string formatMessage(const LogRecord& record);
+  void flushSinks();
+  void closeSinks() noexcept;
 
   static std::string_view levelToString(LogLevel level) noexcept;
   std::string formatTime(std::chrono::system_clock::time_point timestamp);
-  static std::string currentDate();
 
-  std::filesystem::path makeLogFileName() const;
-  static std::size_t fileSize(const std::filesystem::path& filename);
-  void openNewLogFile();
-  void flushPending(std::string& pending);
-  void flushOutput();
-  void rollIfNeeded(std::string_view message, std::string& pending);
-
-  std::ofstream out_;
   BlockingQueue<LogRecord> queue_;
   std::thread worker_;
+  std::vector<std::shared_ptr<LogSink>> sinks_;
 
   // log() 短暂持共享锁获取当前队列代次；init()/stop() 持独占锁切换生命周期。
   mutable std::shared_mutex lifecycleMutex_;
   std::atomic_int minLevel_{static_cast<int>(LogLevel::DEBUG)};
   std::atomic_bool running_{false};
 
-  std::filesystem::path basePath_;
-  std::string currentDate_;
   std::time_t cachedTimestampSecond_{};
   std::string cachedTimestampPrefix_;
   bool hasCachedTimestampPrefix_{false};
-  std::size_t currentSize_{0};
-  std::size_t maxFileSize_{kDefaultMaxFileSize};
-  int fileIndex_{0};
   std::size_t writeBatchSize_{kDefaultWriteBatchSize};
   FlushPolicy flushPolicy_{FlushPolicy::Periodic};
   std::chrono::milliseconds flushInterval_{LoggerConfig::kDefaultFlushInterval};
