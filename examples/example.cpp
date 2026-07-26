@@ -37,7 +37,8 @@ int main() {
   try {
     // 模拟多个业务线程同时提交日志。
     for (int threadIndex = 0; threadIndex < kThreadCount; ++threadIndex) {
-      workers.emplace_back([threadIndex] {
+      // 显式捕获消息数量，兼容 MSVC 对 Lambda 捕获规则的严格检查。
+      workers.emplace_back([threadIndex, kMessagesPerThread] {
         for (int messageIndex = 0; messageIndex < kMessagesPerThread; ++messageIndex) {
           LOG_INFO("thread " + std::to_string(threadIndex) + " writes log " +
                    std::to_string(messageIndex));

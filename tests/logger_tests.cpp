@@ -442,7 +442,8 @@ void testReinitializationAndConcurrentLogging() {
   std::vector<std::thread> workers;
   workers.reserve(kThreadCount);
   for (std::size_t threadIndex = 0; threadIndex < kThreadCount; ++threadIndex) {
-    workers.emplace_back([threadIndex] {
+    // 显式捕获消息数量，避免 MSVC 将其判定为未捕获的局部变量。
+    workers.emplace_back([threadIndex, kMessagesPerThread] {
       for (std::size_t messageIndex = 0; messageIndex < kMessagesPerThread; ++messageIndex) {
         LOG_INFO("concurrent-message-" + std::to_string(threadIndex) + '-' +
                  std::to_string(messageIndex));
