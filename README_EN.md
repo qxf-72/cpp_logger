@@ -7,10 +7,11 @@
 English | [简体中文](README.md)
 
 [![CI](https://github.com/qxf-72/cpp_logger/actions/workflows/ci.yml/badge.svg)](https://github.com/qxf-72/cpp_logger/actions/workflows/ci.yml)
-![C++](https://img.shields.io/badge/C%2B%2B-17-blue.svg)
-![CMake](https://img.shields.io/badge/CMake-3.14%2B-brightgreen.svg)
-![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-brightgreen.svg)
-![License](https://img.shields.io/badge/License-MIT-yellow.svg)
+![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=c%2B%2B)
+![CMake](https://img.shields.io/badge/CMake-3.14%2B-064F8C?logo=cmake)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-555555?logo=linux&logoColor=FCC624)
+![Status](https://img.shields.io/badge/status-early%20development-orange)
+[![License](https://img.shields.io/github/license/qxf-72/cpp_logger?color=yellow)](LICENSE)
 
 </div>
 
