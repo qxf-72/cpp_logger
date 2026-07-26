@@ -177,6 +177,17 @@ Pass the installation prefix when configuring the consumer:
 cmake -S . -B build -DCMAKE_PREFIX_PATH=<install-prefix>
 ```
 
+### Use a Prebuilt Package from GitHub Releases
+
+Starting with `v0.1.1`, pushing a `vX.Y.Z` tag that matches the CMake project version automatically builds and publishes prebuilt CMake packages. Download and extract the asset matching your platform, compiler, and architecture; cloning this repository is not required:
+
+```bash
+cmake -S . -B build -DCMAKE_PREFIX_PATH=<extracted cpp_logger directory>
+cmake --build build --parallel
+```
+
+Packages are provided for Windows MSVC x64, Linux GCC x64, and macOS AppleClang arm64. Each Release includes `SHA256SUMS.txt` for verification. Prebuilt static libraries must not be mixed across platforms or compiler toolchains.
+
 ## 📊 Benchmark
 
 The regular benchmark target is enabled by default and produces CSV output. It reports both producer submission throughput and end-to-end throughput after `stop()` drains and flushes the queue.

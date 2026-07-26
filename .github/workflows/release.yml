@@ -1,0 +1,197 @@
+name: 发布预构建包
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# 默认只读取仓库内容；创建和上传 Release 的权限仅授予最后一个 job。
+permissions:
+  contents: read
+
+jobs:
+  validate-version:
+    name: 校验标签版本
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 校验 Git 标签与 CMake 项目版本一致
+        shell: bash
+        run: |
+          project_version="$(sed -nE 's/^[[:space:]]*project\(cpp_logger[[:space:]]+VERSION[[:space:]]+([^ )]+).*/\1/p' CMakeLists.txt)"
+          expected_tag="v${project_version}"
+
+          if [[ -z "${project_version}" ]]; then
+            echo "无法从 CMakeLists.txt 读取 cpp_logger 的项目版本。" >&2
+            exit 1
+          fi
+
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "标签 ${GITHUB_REF_NAME} 与 CMake 项目版本 ${project_version} 不一致；应推送 ${expected_tag}。" >&2
+            exit 1
+          fi
+
+  package:
+    name: 打包 ${{ matrix.package_id }}
+    needs: validate-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 固定 Windows Server 2022，确保使用 Visual Studio 2022 和稳定的 MSVC ABI。
+          - os: windows-2022
+            package_id: windows-msvc-x64
+          - os: ubuntu-24.04
+            package_id: linux-gcc-x64
+          # macos-latest 当前为 Apple Silicon runner，产物面向 arm64。
+          - os: macos-latest
+            package_id: macos-appleclang-arm64
+
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 配置 CMake（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: >
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          -DBUILD_TESTING=ON
+          -DLOGGER_BUILD_BENCHMARK=OFF
+          -DLOGGER_BUILD_SPDLOG_BENCHMARK=OFF
+
+      - name: 构建（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: 运行 CTest（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ctest --test-dir build -C Release --output-on-failure
+
+      - name: 安装预构建包（Windows）
+        if: runner.os == 'Windows'
+        id: install_windows
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG -replace '^v', ''
+          $packageRoot = "cpp_logger-$version-${{ matrix.package_id }}"
+          cmake --install build --config Release --prefix $packageRoot
+          "PACKAGE_ROOT=$packageRoot" >> $env:GITHUB_ENV
+
+      - name: 验证独立 CMake 消费者（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $prefix = (Resolve-Path $env:PACKAGE_ROOT).Path
+          cmake -S tests/package_consumer -B package-consumer-build -G "Visual Studio 17 2022" -A x64 "-DCMAKE_PREFIX_PATH=$prefix" -DBUILD_TESTING=ON
+          cmake --build package-consumer-build --config Release --parallel
+          ctest --test-dir package-consumer-build -C Release --output-on-failure
+
+      - name: 压缩预构建包（Windows）
+        if: runner.os == 'Windows'
+        id: archive_windows
+        shell: pwsh
+        run: |
+          $archive = "$env:PACKAGE_ROOT.zip"
+          Compress-Archive -Path $env:PACKAGE_ROOT -DestinationPath $archive -CompressionLevel Optimal
+          "file=$archive" >> $env:GITHUB_OUTPUT
+
+      - name: 配置 CMake（Linux 与 macOS）
+        if: runner.os != 'Windows'
+        shell: bash
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_TESTING=ON
+          -DLOGGER_BUILD_BENCHMARK=OFF
+          -DLOGGER_BUILD_SPDLOG_BENCHMARK=OFF
+
+      - name: 构建（Linux 与 macOS）
+        if: runner.os != 'Windows'
+        shell: bash
+        run: cmake --build build --parallel
+
+      - name: 运行 CTest（Linux 与 macOS）
+        if: runner.os != 'Windows'
+        shell: bash
+        run: ctest --test-dir build --output-on-failure
+
+      - name: 安装预构建包（Linux 与 macOS）
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          version="${RELEASE_TAG#v}"
+          package_root="cpp_logger-${version}-${{ matrix.package_id }}"
+          cmake --install build --prefix "${package_root}"
+          echo "PACKAGE_ROOT=${package_root}" >> "${GITHUB_ENV}"
+
+      - name: 验证独立 CMake 消费者（Linux 与 macOS）
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cmake -S tests/package_consumer -B package-consumer-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${PWD}/${PACKAGE_ROOT}" \
+            -DBUILD_TESTING=ON
+          cmake --build package-consumer-build --parallel
+          ctest --test-dir package-consumer-build --output-on-failure
+
+      - name: 压缩预构建包（Linux 与 macOS）
+        if: runner.os != 'Windows'
+        id: archive_unix
+        shell: bash
+        run: |
+          archive="${PACKAGE_ROOT}.tar.gz"
+          tar -czf "${archive}" "${PACKAGE_ROOT}"
+          echo "file=${archive}" >> "${GITHUB_OUTPUT}"
+
+      - name: 上传待发布附件
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.package_id }}
+          path: ${{ runner.os == 'Windows' && steps.archive_windows.outputs.file || steps.archive_unix.outputs.file }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: 创建 GitHub Release
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: 下载所有平台附件
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: 生成 SHA-256 校验文件
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum -- * > SHA256SUMS.txt
+
+      - name: 创建或更新 Release 并上传附件
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if ! gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "cpp_logger ${GITHUB_REF_NAME}" \
+              --generate-notes
+          fi
+
+          gh release upload "${GITHUB_REF_NAME}" release-assets/* --clobber

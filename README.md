@@ -177,6 +177,17 @@ target_link_libraries(app PRIVATE cpp_logger::logger)
 cmake -S . -B build -DCMAKE_PREFIX_PATH=<安装目录>
 ```
 
+### 从 GitHub Release 使用预构建包
+
+从 `v0.1.1` 起，推送与 CMake 项目版本一致的 `vX.Y.Z` 标签会自动构建并发布预构建 CMake 包。下载与本机平台、编译器和架构匹配的附件并解压后，无需克隆本仓库：
+
+```bash
+cmake -S . -B build -DCMAKE_PREFIX_PATH=<解压后的 cpp_logger 目录>
+cmake --build build --parallel
+```
+
+可用附件包括 Windows MSVC x64、Linux GCC x64 和 macOS AppleClang arm64。每个 Release 都会附带 `SHA256SUMS.txt`，可用于校验下载内容；预构建静态库不能跨平台或跨编译器混用。
+
 ## 📊 性能测试
 
 常规压测目标默认开启，输出 CSV，分别报告生产者提交吞吐量与 `stop()` 排空、刷新后的端到端吞吐量：
