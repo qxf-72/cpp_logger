@@ -149,19 +149,35 @@ target_link_libraries(logger_demo PRIVATE
 )
 
 option(LOGGER_BUILD_BENCHMARK "Build the logger performance benchmark" ON)
-option(LOGGER_BUILD_QUILL_BENCHMARK "Build the cpp_logger versus Quill benchmark" OFF)
+option(LOGGER_BUILD_QUILL_BENCHMARK "Build the independent Quill benchmark targets" OFF)
 option(LOGGER_FETCH_QUILL "Fetch the pinned Quill dependency when it is not installed" OFF)
-option(LOGGER_BUILD_SPDLOG_BENCHMARK "Build the standalone spdlog comparison benchmark" OFF)
+option(LOGGER_BUILD_SPDLOG_BENCHMARK "Build the independent spdlog benchmark" OFF)
 option(LOGGER_FETCH_SPDLOG "Fetch the pinned spdlog dependency when it is not installed" OFF)
 
-if(LOGGER_BUILD_BENCHMARK)
-    add_executable(logger_benchmark
-        benchmark/benchmark.cpp
+# 三个独立基准复用同一套启动栅栏、预热、计时、统计和落盘校验，避免比较口径漂移。
+if(LOGGER_BUILD_BENCHMARK OR LOGGER_BUILD_QUILL_BENCHMARK OR LOGGER_BUILD_SPDLOG_BENCHMARK)
+    add_library(logger_benchmark_harness STATIC
+        benchmark/common/BenchmarkHarness.cpp
     )
-    logger_enable_clang_tidy(logger_benchmark)
+    logger_enable_clang_tidy(logger_benchmark_harness)
+    target_include_directories(logger_benchmark_harness PUBLIC
+        ${PROJECT_SOURCE_DIR}/benchmark/common
+    )
+    target_compile_features(logger_benchmark_harness PRIVATE cxx_std_17)
+    target_link_libraries(logger_benchmark_harness PUBLIC
+        Threads::Threads
+    )
+endif()
 
-    target_link_libraries(logger_benchmark PRIVATE
+if(LOGGER_BUILD_BENCHMARK)
+    add_executable(cpp_logger_benchmark
+        benchmark/cpp_logger_benchmark.cpp
+    )
+    logger_enable_clang_tidy(cpp_logger_benchmark)
+
+    target_link_libraries(cpp_logger_benchmark PRIVATE
         logger
+        logger_benchmark_harness
     )
 endif()
 
@@ -196,11 +212,12 @@ if(LOGGER_BUILD_SPDLOG_BENCHMARK)
         message(FATAL_ERROR "spdlog was found but did not export spdlog::spdlog_header_only")
     endif()
 
-    add_executable(logger_spdlog_benchmark
+    add_executable(spdlog_benchmark
         benchmark/spdlog_benchmark.cpp
     )
-    logger_enable_clang_tidy(logger_spdlog_benchmark)
-    target_link_libraries(logger_spdlog_benchmark PRIVATE
+    logger_enable_clang_tidy(spdlog_benchmark)
+    target_link_libraries(spdlog_benchmark PRIVATE
+        logger_benchmark_harness
         spdlog::spdlog_header_only
     )
 endif()
@@ -240,25 +257,25 @@ if(LOGGER_BUILD_QUILL_BENCHMARK)
         message(FATAL_ERROR "Quill was found but did not export quill::quill")
     endif()
 
-    # Quill 约束同一线程只能使用一种 FrontendOptions；阻塞与丢新分别构建为独立可执行程序，
-    # 避免两种队列类型在主线程的 flush 阶段混用。
-    add_executable(logger_quill_blocking_benchmark
-        benchmark/comparison_benchmark.cpp
+    # Quill 约束同一线程只能使用一种 FrontendOptions；阻塞与丢新分别构建为独立可执行程序。
+    # 它们与 cpp_logger、spdlog 分别运行，避免全局后台线程或 registry 相互影响。
+    add_executable(quill_blocking_benchmark
+        benchmark/quill_benchmark.cpp
     )
-    logger_enable_clang_tidy(logger_quill_blocking_benchmark)
-    target_compile_definitions(logger_quill_blocking_benchmark PRIVATE LOGGER_QUILL_QUEUE_MODE=1)
-    target_link_libraries(logger_quill_blocking_benchmark PRIVATE
-        logger
+    logger_enable_clang_tidy(quill_blocking_benchmark)
+    target_compile_definitions(quill_blocking_benchmark PRIVATE LOGGER_QUILL_QUEUE_MODE=1)
+    target_link_libraries(quill_blocking_benchmark PRIVATE
+        logger_benchmark_harness
         quill::quill
     )
 
-    add_executable(logger_quill_dropping_benchmark
-        benchmark/comparison_benchmark.cpp
+    add_executable(quill_dropping_benchmark
+        benchmark/quill_benchmark.cpp
     )
-    logger_enable_clang_tidy(logger_quill_dropping_benchmark)
-    target_compile_definitions(logger_quill_dropping_benchmark PRIVATE LOGGER_QUILL_QUEUE_MODE=2)
-    target_link_libraries(logger_quill_dropping_benchmark PRIVATE
-        logger
+    logger_enable_clang_tidy(quill_dropping_benchmark)
+    target_compile_definitions(quill_dropping_benchmark PRIVATE LOGGER_QUILL_QUEUE_MODE=2)
+    target_link_libraries(quill_dropping_benchmark PRIVATE
+        logger_benchmark_harness
         quill::quill
     )
 endif()

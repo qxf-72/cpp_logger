@@ -226,83 +226,108 @@ GitHub Release 提供 Windows MSVC x64、Linux GCC x64 和 macOS AppleClang arm6
 
 ## 📊 性能测试
 
-常规压测分别统计生产者提交吞吐量，以及 `stop()` 排空、刷新完成后的端到端吞吐量：
+旧版表格混用了 MinGW/GCC 与 MSVC，并且 Quill 含有 MinGW 专用绕行，不能作为跨库排名。该历史数据已移除；新的基准把三套实现拆成独立进程，但复用同一套启动栅栏、预热、固定正文、计时、统计和落盘校验逻辑。正式对照应在同一台机器、同一 MSVC Release 构建树中重新生成。
 
-```bash
-# Linux / macOS
-./build/logger_benchmark --threads 4 --messages 50000 --payload 128 --runs 5
+### 统一构建环境
 
-# Windows PowerShell
-.\build\logger_benchmark.exe --threads 4 --messages 50000 --payload 128 --runs 5
+推荐 Windows 原生 x64、Visual Studio 2022 的 MSVC v143 工具链。以下命令在同一 CMake 构建树中编译 `cpp_logger`、Quill v9.0.3 和 spdlog v1.17.0：
+
+```powershell
+cmake -S . -B build-benchmark-msvc -G "Visual Studio 17 2022" -A x64 `
+  -DBUILD_TESTING=OFF `
+  -DLOGGER_BUILD_BENCHMARK=ON `
+  -DLOGGER_BUILD_QUILL_BENCHMARK=ON -DLOGGER_FETCH_QUILL=ON `
+  -DLOGGER_BUILD_SPDLOG_BENCHMARK=ON -DLOGGER_FETCH_SPDLOG=ON
+
+cmake --build build-benchmark-msvc --config Release `
+  --target cpp_logger_benchmark spdlog_benchmark quill_blocking_benchmark quill_dropping_benchmark `
+  --parallel
 ```
 
-| 参数 | 说明 |
+第三方目标默认关闭，因此日常构建不会下载 Quill 或 spdlog。请记录 CPU、Windows 版本、MSVC 版本、CMake 版本和完整 CMake 配置；不要把 Linux/GCC 与 Windows/MSVC 的结果放入同一张比较表。
+
+### 运行矩阵
+
+默认工作负载为每生产者 250,000 条、128 B 正文、1 次完整预热和 10 次计量。主表使用 `final-drain`：生产完成后等待队列排空并显式刷新；`periodic` 仅用于单独考察定时刷新，不应与主表混用。
+
+```powershell
+$common = @("--threads", "4", "--messages", "250000", "--payload", "128", `
+            "--warmups", "1", "--runs", "10", "--flush-mode", "final-drain")
+
+# Block：三库均参与
+& .\build-benchmark-msvc\Release\cpp_logger_benchmark.exe @common --queue-per-thread 2048 --profile block
+& .\build-benchmark-msvc\Release\spdlog_benchmark.exe @common --queue-per-thread 2048 --profile block
+& .\build-benchmark-msvc\Release\quill_blocking_benchmark.exe @common --profile block
+
+# DropNewest：三库均参与
+& .\build-benchmark-msvc\Release\cpp_logger_benchmark.exe @common --queue-per-thread 2048 --profile drop-newest
+& .\build-benchmark-msvc\Release\spdlog_benchmark.exe @common --queue-per-thread 2048 --profile drop-newest
+& .\build-benchmark-msvc\Release\quill_dropping_benchmark.exe @common --profile drop-newest
+
+# DropOldest：Quill 没有等价队列，只比较 cpp_logger 与 spdlog
+& .\build-benchmark-msvc\Release\cpp_logger_benchmark.exe @common --queue-per-thread 2048 --profile drop-oldest
+& .\build-benchmark-msvc\Release\spdlog_benchmark.exe @common --queue-per-thread 2048 --profile drop-oldest
+```
+
+对 `4`、`8`、`16` 个生产者分别重复这组命令，并在每个线程数下交替运行不同实现，减少温度、缓存和后台任务造成的顺序偏差。`cpp_logger` 与 spdlog 的容量单位是“记录数”，Quill 的容量是“每生产者 SPSC 队列字节数”（固定 256 KiB）；它们不是严格相等的容量，因此结果会完整输出容量描述，比较时应以过载语义和实际保留量为主。
+
+### 统计口径
+
+每个可执行程序单独运行，避免 Quill 后端、spdlog 全局线程池或 registry 相互干扰。每轮在正文中嵌入唯一 marker；停止、排空并关闭文件后再扫描 `.log` 文件，校验实际落盘条数。校验和删除临时日志均不计入性能时间。
+
+| 输出字段 | 含义 |
 | --- | --- |
-| `--threads <N>` | 生产者线程数。 |
-| `--messages <N>` | 每个生产者提交的日志数。 |
-| `--payload <N>` | 单条日志正文大小（字节）。 |
-| `--runs <N>` | 重复轮数。 |
-| `--batch-size <N>` | 后台线程单批记录数。 |
-| `--flush-policy <...>` | `on-stop`、`periodic` 或 `every-batch`。 |
+| `attempted_producer_logs_per_second` | 所有生产者尝试提交的速率；丢弃模式下不能代表可靠写入能力。 |
+| `accepted_producer_logs_per_second` | 以最终保留记录数折算的生产者阶段速率。 |
+| `delivered_end_to_end_logs_per_second` | 从统一起跑到后台排空、刷新完成后的实际落盘速率。 |
+| `drop_rate_percent` | `attempted - delivered` 占尝试总数的比例，来自 marker 校验而非不同库的私有计数器。 |
 
-一次本机 Release 测试中，`cpp_logger` 使用 Windows、MSYS2 MinGW-w64 GCC 15.2.0，4 个生产者、每线程 250,000 条、128 B 正文、`Block + Periodic 1 s`、3 轮平均，端到端吞吐约为 **123.80 万条/秒**。
+输出先给出每次计量轮的 CSV 行，再给出最小值、中位数和最大值。
 
-<details>
-<summary><strong>展开查看不同实现与工具链下的参考数据、复现命令和完整结果</strong></summary>
+### 快速重测结果（MSVC）
 
-第三方对照目标默认关闭，不会影响常规构建。Quill 固定为 v9.0.3，spdlog 固定为 v1.17.0。
-
-```bash
-# Quill：Ninja / Release
-cmake -S . -B build-quill -G Ninja -DCMAKE_BUILD_TYPE=Release -DLOGGER_BUILD_QUILL_BENCHMARK=ON -DLOGGER_FETCH_QUILL=ON
-cmake --build build-quill --target logger_quill_blocking_benchmark logger_quill_dropping_benchmark --parallel
-
-# spdlog：Windows MSVC x64 / Release
-cmake -S . -B build-spdlog-msvc -G "Visual Studio 17 2022" -A x64 -DLOGGER_BUILD_SPDLOG_BENCHMARK=ON -DLOGGER_FETCH_SPDLOG=ON
-cmake --build build-spdlog-msvc --config Release --target logger_spdlog_benchmark --parallel
-```
-
-Quill 的可靠与丢新 Profile 必须使用独立可执行程序；spdlog 的 `Block` 和 `DiscardNew` 分别对齐可靠与丢新语义。`DropOldest` / `OverrunOldest` 未纳入表格，因为没有同一轮、同一工具链下的等价对照数据。
-
-`cpp_logger` 与 Quill 行来自 2026-07-26 的 Windows、MSYS2 MinGW-w64 GCC 15.2.0、Release 测试；spdlog 行来自 2026-07-27 的 Windows、Visual Studio 2022 x64、MSVC 19.40.33811、Release 测试。每个配置均为 3 轮、每生产者 250,000 条、128 B 正文、1 秒周期刷新。由于编译器、队列拓扑、格式化器和 Sink 都不同，下表只能描述特定配置，**不能用作严格的跨库排名**。
+环境：Windows x64、MSVC 19.40.33811、Visual Studio 2022 Generator、Release、Quill v9.0.3、spdlog v1.17.0。每组为每线程 100,000 条、128 B 正文、`final-drain`、1 次预热和 3 次计量；表中为中位数，吞吐量单位为万条/秒。`cpp_logger` 与 spdlog 使用每生产者 2,048 条记录的队列，Quill 使用每生产者 256 KiB SPSC 队列，容量单位不同，不能理解为严格等容量对照。
 
 #### 4 个生产者
 
-| 场景 / 实现 | 队列策略 | 生产者吞吐量（万条/秒） | 端到端吞吐量（万条/秒） | 丢弃率 |
+| 场景 / 实现 | 队列策略 | 生产者吞吐量 | 端到端吞吐量 | 丢弃率 |
 | --- | --- | ---: | ---: | ---: |
-| 可靠 / 周期刷新（cpp_logger） | Block | 124.92 | 123.80 | 0.0000% |
-| 可靠 / 周期刷新（spdlog，MSVC） | Block | 48.30 | 48.16 | 0.0000% |
-| 可靠 / 周期刷新（Quill） | UnboundedBlocking | 874.92 | 80.53 | 0.0000% |
-| 容忍丢失 / 丢新（cpp_logger） | DropNewest | 309.61 | 120.15 | 60.3628% |
-| 容忍丢失 / 丢新（spdlog，MSVC） | DiscardNew | 460.29 | 76.98 | 82.7957% |
-| 容忍丢失 / 丢新（Quill） | BoundedDropping | 5273.86 | 80.30 | 97.4055% |
+| cpp_logger | Block | 139.83 | 136.89 | 0.00% |
+| spdlog | Block | 52.68 | 52.26 | 0.00% |
+| Quill | Block | 39.23 | 37.58 | 0.00% |
+| cpp_logger | DropNewest | 480.26 | 137.93 | 69.00% |
+| spdlog | DropNewest | 455.27 | 84.19 | 80.43% |
+| Quill | DropNewest | 12,138.13 | 23.65 | 98.00% |
+| cpp_logger | DropOldest | 380.01 | 138.24 | 62.67% |
+| spdlog | DropOldest | 310.87 | 52.93 | 81.88% |
 
 #### 8 个生产者
 
-| 场景 / 实现 | 队列策略 | 生产者吞吐量（万条/秒） | 端到端吞吐量（万条/秒） | 丢弃率 |
+| 场景 / 实现 | 队列策略 | 生产者吞吐量 | 端到端吞吐量 | 丢弃率 |
 | --- | --- | ---: | ---: | ---: |
-| 可靠 / 周期刷新（cpp_logger） | Block | 103.37 | 102.60 | 0.0000% |
-| 可靠 / 周期刷新（spdlog，MSVC） | Block | 33.91 | 33.83 | 0.0000% |
-| 可靠 / 周期刷新（Quill） | UnboundedBlocking | 943.82 | 73.11 | 0.0000% |
-| 容忍丢失 / 丢新（cpp_logger） | DropNewest | 230.12 | 103.53 | 54.2425% |
-| 容忍丢失 / 丢新（spdlog，MSVC） | DiscardNew | 428.28 | 47.40 | 88.6532% |
-| 容忍丢失 / 丢新（Quill） | BoundedDropping | 5906.90 | 65.62 | 97.8928% |
+| cpp_logger | Block | 108.40 | 106.54 | 0.00% |
+| spdlog | Block | 36.53 | 36.32 | 0.00% |
+| Quill | Block | 75.93 | 72.53 | 0.00% |
+| cpp_logger | DropNewest | 332.69 | 119.00 | 63.12% |
+| spdlog | DropNewest | 426.00 | 52.27 | 86.96% |
+| Quill | DropNewest | 22,256.22 | 21.95 | 98.40% |
+| cpp_logger | DropOldest | 269.42 | 124.48 | 51.91% |
+| spdlog | DropOldest | 279.48 | 31.13 | 88.39% |
 
 #### 16 个生产者
 
-| 场景 / 实现 | 队列策略 | 生产者吞吐量（万条/秒） | 端到端吞吐量（万条/秒） | 丢弃率 |
+| 场景 / 实现 | 队列策略 | 生产者吞吐量 | 端到端吞吐量 | 丢弃率 |
 | --- | --- | ---: | ---: | ---: |
-| 可靠 / 周期刷新（cpp_logger） | Block | 72.30 | 71.62 | 0.0000% |
-| 可靠 / 周期刷新（spdlog，MSVC） | Block | 33.77 | 33.70 | 0.0000% |
-| 可靠 / 周期刷新（Quill） | UnboundedBlocking | 843.36 | 68.28 | 0.0000% |
-| 容忍丢失 / 丢新（cpp_logger） | DropNewest | 123.35 | 36.84 | 69.7742% |
-| 容忍丢失 / 丢新（spdlog，MSVC） | DiscardNew | 463.51 | 26.23 | 94.1834% |
-| 容忍丢失 / 丢新（Quill） | BoundedDropping | 6194.27 | 46.62 | 98.3951% |
+| cpp_logger | Block | 86.15 | 84.96 | 0.00% |
+| spdlog | Block | 35.56 | 35.34 | 0.00% |
+| Quill | Block | 84.68 | 83.25 | 0.00% |
+| cpp_logger | DropNewest | 329.70 | 26.81 | 91.44% |
+| spdlog | DropNewest | 432.20 | 33.32 | 91.79% |
+| Quill | DropNewest | 44,927.41 | 35.19 | 98.40% |
+| cpp_logger | DropOldest | 156.67 | 81.78 | 46.18% |
+| spdlog | DropOldest | 179.62 | 13.04 | 92.54% |
 
-- 丢新策略的高提交速率伴随较高丢弃率，不能视为可靠写入能力。
-- 选择日志库或过载策略时，应同时考察端到端吞吐、最终保留量、延迟与业务可接受的丢失上限。
-
-</details>
+可靠模式应优先看端到端吞吐；丢弃模式的高生产者吞吐意味着调用方更快地放弃了记录，不能当作可靠写入能力。若用于最终对外结论，建议按上方命令把每组扩展到 10 次计量，并保留原始 CSV。
 
 ## 🗺️ 后续计划
 

@@ -226,83 +226,108 @@ GitHub Releases provide prebuilt packages for Windows MSVC x64, Linux GCC x64, a
 
 ## 📊 Benchmark
 
-The regular benchmark reports both producer submission throughput and end-to-end throughput after `stop()` drains and flushes the queue:
+The old table mixed MinGW/GCC and MSVC and included a MinGW-specific Quill workaround, so it cannot be used as a cross-library ranking. It has been removed. The new suite runs each implementation in an independent process while sharing one start barrier, warmup policy, fixed payload, timing model, statistics, and on-disk verification. Generate the comparison data again from one MSVC Release build tree on one machine.
 
-```bash
-# Linux / macOS
-./build/logger_benchmark --threads 4 --messages 50000 --payload 128 --runs 5
+### Unified build environment
 
-# Windows PowerShell
-.\build\logger_benchmark.exe --threads 4 --messages 50000 --payload 128 --runs 5
+Windows native x64 with the Visual Studio 2022 MSVC v143 toolchain is the recommended primary environment. The following commands build `cpp_logger`, Quill v9.0.3, and spdlog v1.17.0 from the same CMake build tree:
+
+```powershell
+cmake -S . -B build-benchmark-msvc -G "Visual Studio 17 2022" -A x64 `
+  -DBUILD_TESTING=OFF `
+  -DLOGGER_BUILD_BENCHMARK=ON `
+  -DLOGGER_BUILD_QUILL_BENCHMARK=ON -DLOGGER_FETCH_QUILL=ON `
+  -DLOGGER_BUILD_SPDLOG_BENCHMARK=ON -DLOGGER_FETCH_SPDLOG=ON
+
+cmake --build build-benchmark-msvc --config Release `
+  --target cpp_logger_benchmark spdlog_benchmark quill_blocking_benchmark quill_dropping_benchmark `
+  --parallel
 ```
 
-| Option | Description |
+Third-party targets are off by default and do not affect normal builds. Record the CPU, Windows version, MSVC version, CMake version, and full CMake configuration. Do not put Linux/GCC and Windows/MSVC results in the same comparison table.
+
+### Execution matrix
+
+The default workload is 250,000 records per producer, a 128-byte body, one complete warmup, and ten measured runs. The primary table uses `final-drain`: after production completes, the benchmark drains and explicitly flushes the backend. Use `periodic` only to study timed flushing separately.
+
+```powershell
+$common = @("--threads", "4", "--messages", "250000", "--payload", "128", `
+            "--warmups", "1", "--runs", "10", "--flush-mode", "final-drain")
+
+# Block: all three libraries
+& .\build-benchmark-msvc\Release\cpp_logger_benchmark.exe @common --queue-per-thread 2048 --profile block
+& .\build-benchmark-msvc\Release\spdlog_benchmark.exe @common --queue-per-thread 2048 --profile block
+& .\build-benchmark-msvc\Release\quill_blocking_benchmark.exe @common --profile block
+
+# DropNewest: all three libraries
+& .\build-benchmark-msvc\Release\cpp_logger_benchmark.exe @common --queue-per-thread 2048 --profile drop-newest
+& .\build-benchmark-msvc\Release\spdlog_benchmark.exe @common --queue-per-thread 2048 --profile drop-newest
+& .\build-benchmark-msvc\Release\quill_dropping_benchmark.exe @common --profile drop-newest
+
+# DropOldest: Quill has no equivalent queue, so compare cpp_logger and spdlog only
+& .\build-benchmark-msvc\Release\cpp_logger_benchmark.exe @common --queue-per-thread 2048 --profile drop-oldest
+& .\build-benchmark-msvc\Release\spdlog_benchmark.exe @common --queue-per-thread 2048 --profile drop-oldest
+```
+
+Repeat the matrix for `4`, `8`, and `16` producers. Alternate implementations within each producer count to reduce ordering bias from temperature, cache state, and background work. `cpp_logger` and spdlog measure capacity in records; Quill uses a fixed 256 KiB per-producer SPSC queue. Those capacities are not strictly equivalent, so each result includes the exact capacity description and should be interpreted primarily by overload semantics and retained-record count.
+
+### Measurement contract
+
+Each executable runs independently, preventing Quill's backend, spdlog's global thread pool, or registry from affecting another library. Every run embeds a unique marker in the payload. Only after stopping, draining, flushing, and closing files does the harness scan `.log` files to validate the persisted record count. Validation and log cleanup are outside the timed interval.
+
+| Output field | Meaning |
 | --- | --- |
-| `--threads <N>` | Producer count. |
-| `--messages <N>` | Records submitted per producer. |
-| `--payload <N>` | Message-body size in bytes. |
-| `--runs <N>` | Number of repeated runs. |
-| `--batch-size <N>` | Backend writer batch size. |
-| `--flush-policy <...>` | `on-stop`, `periodic`, or `every-batch`. |
+| `attempted_producer_logs_per_second` | Submission rate for every attempted record; it is not reliable-write capacity in dropping modes. |
+| `accepted_producer_logs_per_second` | Producer-phase rate calculated from the ultimately retained records. |
+| `delivered_end_to_end_logs_per_second` | Persisted-record rate from the common start point through drain and flush completion. |
+| `drop_rate_percent` | `(attempted - delivered) / attempted`, derived from marker verification rather than library-specific private counters. |
 
-In one local Release measurement, `cpp_logger` achieved **123.80 × 10k records/s** end-to-end using Windows, MSYS2 MinGW-w64 GCC 15.2.0, four producers, 250,000 records per producer, a 128-byte payload, `Block + Periodic 1 s`, and the mean of three runs.
+The output first contains CSV rows for every measured run, followed by minimum, median, and maximum summary rows.
 
-<details>
-<summary><strong>Expand for reference data across implementations/toolchains, commands, and full results</strong></summary>
+### Quick rerun results (MSVC)
 
-Third-party targets are off by default and do not affect normal builds. Quill is pinned to v9.0.3 and spdlog to v1.17.0.
-
-```bash
-# Quill: Ninja / Release
-cmake -S . -B build-quill -G Ninja -DCMAKE_BUILD_TYPE=Release -DLOGGER_BUILD_QUILL_BENCHMARK=ON -DLOGGER_FETCH_QUILL=ON
-cmake --build build-quill --target logger_quill_blocking_benchmark logger_quill_dropping_benchmark --parallel
-
-# spdlog: Windows MSVC x64 / Release
-cmake -S . -B build-spdlog-msvc -G "Visual Studio 17 2022" -A x64 -DLOGGER_BUILD_SPDLOG_BENCHMARK=ON -DLOGGER_FETCH_SPDLOG=ON
-cmake --build build-spdlog-msvc --config Release --target logger_spdlog_benchmark --parallel
-```
-
-Quill uses separate executables for reliable and drop-newest profiles. spdlog's `Block` and `DiscardNew` align with those two semantics. `DropOldest` / `OverrunOldest` are omitted because no equivalent data were measured in the same run and toolchain.
-
-The cpp_logger and Quill rows were measured on 2026-07-26 using Windows, MSYS2 MinGW-w64 GCC 15.2.0, and Release. The spdlog rows were independently measured on 2026-07-27 using Windows, Visual Studio 2022 x64, MSVC 19.40.33811, and Release. Every configuration used three runs, 250,000 records per producer, a 128-byte payload, and one-second periodic flushing. Compilers, queue topologies, formatters, and sinks differ, so the table describes specific configurations and **is not a strict cross-library ranking**.
+Environment: Windows x64, MSVC 19.40.33811, Visual Studio 2022 generator, Release, Quill v9.0.3, and spdlog v1.17.0. Each configuration used 100,000 records per producer, a 128-byte payload, `final-drain`, one warmup, and three measured runs. Values below are medians; rates are in 10k records/s. `cpp_logger` and spdlog used 2,048 record slots per producer, while Quill used a 256 KiB per-producer SPSC queue. The capacity units differ and are not strictly equivalent.
 
 #### 4 producers
 
-| Scenario / implementation | Queue policy | Producer rate (10k records/s) | End-to-end rate (10k records/s) | Drop rate |
+| Implementation | Queue policy | Producer rate | End-to-end rate | Drop rate |
 | --- | --- | ---: | ---: | ---: |
-| Reliable / periodic (`cpp_logger`) | Block | 124.92 | 123.80 | 0.0000% |
-| Reliable / periodic (spdlog, MSVC) | Block | 48.30 | 48.16 | 0.0000% |
-| Reliable / periodic (Quill) | UnboundedBlocking | 874.92 | 80.53 | 0.0000% |
-| Loss-tolerant / discard newest (`cpp_logger`) | DropNewest | 309.61 | 120.15 | 60.3628% |
-| Loss-tolerant / discard newest (spdlog, MSVC) | DiscardNew | 460.29 | 76.98 | 82.7957% |
-| Loss-tolerant / discard newest (Quill) | BoundedDropping | 5273.86 | 80.30 | 97.4055% |
+| cpp_logger | Block | 139.83 | 136.89 | 0.00% |
+| spdlog | Block | 52.68 | 52.26 | 0.00% |
+| Quill | Block | 39.23 | 37.58 | 0.00% |
+| cpp_logger | DropNewest | 480.26 | 137.93 | 69.00% |
+| spdlog | DropNewest | 455.27 | 84.19 | 80.43% |
+| Quill | DropNewest | 12,138.13 | 23.65 | 98.00% |
+| cpp_logger | DropOldest | 380.01 | 138.24 | 62.67% |
+| spdlog | DropOldest | 310.87 | 52.93 | 81.88% |
 
 #### 8 producers
 
-| Scenario / implementation | Queue policy | Producer rate (10k records/s) | End-to-end rate (10k records/s) | Drop rate |
+| Implementation | Queue policy | Producer rate | End-to-end rate | Drop rate |
 | --- | --- | ---: | ---: | ---: |
-| Reliable / periodic (`cpp_logger`) | Block | 103.37 | 102.60 | 0.0000% |
-| Reliable / periodic (spdlog, MSVC) | Block | 33.91 | 33.83 | 0.0000% |
-| Reliable / periodic (Quill) | UnboundedBlocking | 943.82 | 73.11 | 0.0000% |
-| Loss-tolerant / discard newest (`cpp_logger`) | DropNewest | 230.12 | 103.53 | 54.2425% |
-| Loss-tolerant / discard newest (spdlog, MSVC) | DiscardNew | 428.28 | 47.40 | 88.6532% |
-| Loss-tolerant / discard newest (Quill) | BoundedDropping | 5906.90 | 65.62 | 97.8928% |
+| cpp_logger | Block | 108.40 | 106.54 | 0.00% |
+| spdlog | Block | 36.53 | 36.32 | 0.00% |
+| Quill | Block | 75.93 | 72.53 | 0.00% |
+| cpp_logger | DropNewest | 332.69 | 119.00 | 63.12% |
+| spdlog | DropNewest | 426.00 | 52.27 | 86.96% |
+| Quill | DropNewest | 22,256.22 | 21.95 | 98.40% |
+| cpp_logger | DropOldest | 269.42 | 124.48 | 51.91% |
+| spdlog | DropOldest | 279.48 | 31.13 | 88.39% |
 
 #### 16 producers
 
-| Scenario / implementation | Queue policy | Producer rate (10k records/s) | End-to-end rate (10k records/s) | Drop rate |
+| Implementation | Queue policy | Producer rate | End-to-end rate | Drop rate |
 | --- | --- | ---: | ---: | ---: |
-| Reliable / periodic (`cpp_logger`) | Block | 72.30 | 71.62 | 0.0000% |
-| Reliable / periodic (spdlog, MSVC) | Block | 33.77 | 33.70 | 0.0000% |
-| Reliable / periodic (Quill) | UnboundedBlocking | 843.36 | 68.28 | 0.0000% |
-| Loss-tolerant / discard newest (`cpp_logger`) | DropNewest | 123.35 | 36.84 | 69.7742% |
-| Loss-tolerant / discard newest (spdlog, MSVC) | DiscardNew | 463.51 | 26.23 | 94.1834% |
-| Loss-tolerant / discard newest (Quill) | BoundedDropping | 6194.27 | 46.62 | 98.3951% |
+| cpp_logger | Block | 86.15 | 84.96 | 0.00% |
+| spdlog | Block | 35.56 | 35.34 | 0.00% |
+| Quill | Block | 84.68 | 83.25 | 0.00% |
+| cpp_logger | DropNewest | 329.70 | 26.81 | 91.44% |
+| spdlog | DropNewest | 432.20 | 33.32 | 91.79% |
+| Quill | DropNewest | 44,927.41 | 35.19 | 98.40% |
+| cpp_logger | DropOldest | 156.67 | 81.78 | 46.18% |
+| spdlog | DropOldest | 179.62 | 13.04 | 92.54% |
 
-- High producer rates in dropping modes come with high drop rates and do not indicate reliable-write capacity.
-- Choose a library or overflow policy using end-to-end throughput, retained-record count, latency, and the application's tolerated-loss budget together.
-
-</details>
+Use end-to-end rate for reliable modes. A high producer rate in a dropping mode only means the caller discarded records faster; it is not reliable-write capacity. For a final published conclusion, extend every configuration to ten measured runs with the commands above and preserve the raw CSV output.
 
 ## 🗺️ Roadmap
 

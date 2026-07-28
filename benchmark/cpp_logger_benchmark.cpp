@@ -1,16 +1,8 @@
-#include <spdlog/async.h>
-#include <spdlog/async_logger.h>
-#include <spdlog/sinks/basic_file_sink.h>
-#include <spdlog/spdlog.h>
-#include <spdlog/version.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
-#include <filesystem>
 #include <iostream>
 #include <limits>
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -18,6 +10,7 @@
 #include <vector>
 
 #include "BenchmarkHarness.h"
+#include "Logger.h"
 
 namespace {
 
@@ -30,23 +23,26 @@ using benchmark_support::RunPhase;
 
 struct BenchmarkOptions {
   CommonOptions common;
-  // spdlog 的异步 MPMC 队列以记录数计量；总容量随生产者数量线性增长。
+  // cpp_logger 的队列按“记录数”计量；总容量随生产者数量线性增长。
   std::size_t queueCapacityPerProducer{2048};
+  std::size_t writeBatchSize{LoggerConfig::kDefaultWriteBatchSize};
 };
 
 struct BenchmarkProfile {
   std::string_view id;
   std::string_view queuePolicy;
-  spdlog::async_overflow_policy overflowPolicy;
+  OverflowPolicy overflowPolicy;
 };
 
 void printUsage(const char* program) {
   std::cout << "Usage: " << program << " [options]\n\n"
-            << "Measure spdlog asynchronous file logging.\n\n"
+            << "Measure cpp_logger asynchronous file logging.\n\n"
             << "Common options:\n";
   benchmark_support::printCommonUsage(std::cout);
-  std::cout << "\nspdlog options:\n"
-            << "  --queue-per-thread <N>    Async queue records per producer (default: 2048)\n"
+  std::cout << "\ncpp_logger options:\n"
+            << "  --queue-per-thread <N>    Queue records per producer (default: 2048)\n"
+            << "  --batch-size <N>          Records formatted and written per backend batch "
+               "(default: 256)\n"
             << "  --help                    Show this help message\n\n"
             << "Profiles: block, drop-newest, drop-oldest\n";
 }
@@ -74,6 +70,8 @@ BenchmarkOptions parseOptions(int argc, char* argv[]) {
     }
     if (argument == "--queue-per-thread") {
       options.queueCapacityPerProducer = benchmark_support::parsePositiveSize(value, argument);
+    } else if (argument == "--batch-size") {
+      options.writeBatchSize = benchmark_support::parsePositiveSize(value, argument);
     } else {
       throw std::invalid_argument("unknown option: " + std::string(argument));
     }
@@ -104,90 +102,71 @@ void validateProfiles(const BenchmarkOptions& options,
   }
 }
 
-void shutdownSpdlog(std::string_view loggerName, std::shared_ptr<spdlog::async_logger>& logger,
-                    std::shared_ptr<spdlog::details::thread_pool>& threadPool,
-                    std::shared_ptr<spdlog::sinks::basic_file_sink_st>& sink) noexcept {
-  try {
-    if (!loggerName.empty()) {
-      spdlog::drop(std::string(loggerName));
-    }
-    logger.reset();
-    // shutdown() 同时停止 flush_every 创建的定时线程，并从 registry 解除全局引用。
-    spdlog::shutdown();
-    // 局部持有的线程池析构时会排空此前已接收的异步任务并 join 后端线程。
-    threadPool.reset();
-    sink.reset();
-  } catch (...) {
-    // 异常清理路径不能掩盖原始 benchmark 错误。
-  }
+FlushPolicy loggerFlushPolicy(benchmark_support::FlushMode mode) {
+  return mode == benchmark_support::FlushMode::FinalDrain ? FlushPolicy::OnStop
+                                                          : FlushPolicy::Periodic;
 }
 
 RunMetrics runOnce(const BenchmarkOptions& options, const BenchmarkProfile& profile, RunPhase phase,
                    std::size_t runIndex) {
   RunContext context =
-      benchmark_support::makeRunContext(options.common, "spdlog", profile.id, phase, runIndex);
-  const std::string loggerName = "spdlog_benchmark_" + context.outputDirectory.filename().string();
-  std::shared_ptr<spdlog::details::thread_pool> threadPool;
-  std::shared_ptr<spdlog::sinks::basic_file_sink_st> sink;
-  std::shared_ptr<spdlog::async_logger> logger;
+      benchmark_support::makeRunContext(options.common, "cpp_logger", profile.id, phase, runIndex);
+  Logger& logger = Logger::instance();
+  bool initialized = false;
 
   try {
-    // 线程池、registry 和 periodic worker 都是进程级资源；每轮彻底重建以隔离状态。
-    spdlog::shutdown();
-    spdlog::init_thread_pool(queueCapacity(options), 1);
-    threadPool = spdlog::thread_pool();
-    if (!threadPool) {
-      throw std::runtime_error("unable to create spdlog thread pool");
+    // 先确保上一轮已经结束，避免单例残留状态污染本轮配置。
+    logger.stop();
+
+    LoggerConfig config;
+    config.basePath = context.outputDirectory / "cpp_logger";
+    config.minLevel = LogLevel::INFO;
+    // 基准不测滚动行为，使用实际不可达到的阈值保持单文件写入路径稳定。
+    config.maxFileSize = std::numeric_limits<std::size_t>::max() / 2;
+    config.queueCapacity = queueCapacity(options);
+    config.overflowPolicy = profile.overflowPolicy;
+    config.writeBatchSize = options.writeBatchSize;
+    config.flushPolicy = loggerFlushPolicy(options.common.flushMode);
+    config.flushInterval = std::chrono::milliseconds(
+        static_cast<std::chrono::milliseconds::rep>(options.common.flushIntervalMilliseconds));
+    config.flushAtOrAbove = std::nullopt;
+    config.enableConsoleSink = false;
+
+    if (!logger.init(config)) {
+      throw std::runtime_error("unable to initialize cpp_logger");
     }
+    initialized = true;
 
-    sink = std::make_shared<spdlog::sinks::basic_file_sink_st>(
-        (context.outputDirectory / "spdlog.log").string(), true);
-    logger = std::make_shared<spdlog::async_logger>(loggerName, sink, threadPool,
-                                                    profile.overflowPolicy);
-    logger->set_level(spdlog::level::info);
-    // 三个实现都格式化时间、级别、线程标识、源位置和正文。
-    logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e][%l][tid:%t][%s:%#] %v");
-    logger->flush_on(spdlog::level::off);
-    spdlog::register_logger(logger);
-
-    if (options.common.flushMode == benchmark_support::FlushMode::Periodic) {
-      spdlog::flush_every(std::chrono::milliseconds(options.common.flushIntervalMilliseconds));
-    }
-
-    // 源位置在整轮中恒定，提前构造，避免把该无关工作带入生产者热路径。
-    const spdlog::source_loc source{__FILE__, __LINE__, SPDLOG_FUNCTION};
     auto producers = benchmark_support::startProducers(
-        options.common, context.payload, [&logger, source](const std::string& message) {
-          logger->log(source, spdlog::level::info,
-                      spdlog::string_view_t(message.data(), message.size()));
+        options.common, context.payload, [](const std::string& message) {
+          // 使用对外公开的日志调用路径；正文在后台线程格式化。
+          Logger::instance().logStatic(LogLevel::INFO, __FILE__, __LINE__, message);
         });
     const benchmark_support::ProducerTiming timing = producers->timing();
 
-    // discard_new 满时可能拒绝 flush 请求，因此以线程池销毁作为可靠排空边界。
-    spdlog::drop(loggerName);
-    logger.reset();
-    spdlog::shutdown();
-    threadPool.reset();
-    sink->flush();
+    // stop() 关闭输入、排空已经接收的记录并刷新文件，因此结束时间是端到端完成边界。
+    logger.stop();
+    initialized = false;
     const Clock::time_point finished = Clock::now();
-    // Windows 下先关闭文件句柄，再以 marker 读取并验证落盘结果。
-    sink.reset();
+    const std::uint64_t dropped = logger.droppedCount();
 
+    // 所有库都在排空后才回收生产者，避免线程局部资源提前销毁影响后台消费。
     producers->releaseAndJoin();
-    const RunMetrics metrics = benchmark_support::finalizeRun(context, timing, finished);
+    const RunMetrics metrics = benchmark_support::finalizeRun(context, timing, finished, dropped);
     benchmark_support::cleanupRunDirectory(context, options.common.keepLogs);
     return metrics;
   } catch (...) {
-    shutdownSpdlog(loggerName, logger, threadPool, sink);
+    if (initialized) {
+      logger.stop();
+    }
     benchmark_support::cleanupRunDirectory(context, options.common.keepLogs);
     throw;
   }
 }
 
 BenchmarkMetadata metadataFor(const BenchmarkOptions& options, const BenchmarkProfile& profile) {
-  return {"spdlog",
-          std::to_string(SPDLOG_VER_MAJOR) + "." + std::to_string(SPDLOG_VER_MINOR) + "." +
-              std::to_string(SPDLOG_VER_PATCH),
+  return {"cpp_logger",
+          "0.1.1",
           std::string(profile.id),
           std::string(profile.queuePolicy),
           std::to_string(queueCapacity(options)) + " records total",
@@ -195,13 +174,14 @@ BenchmarkMetadata metadataFor(const BenchmarkOptions& options, const BenchmarkPr
 }
 
 void printPreamble(const BenchmarkOptions& options) {
-  std::cout << "# benchmark=spdlog\n"
+  std::cout << "# benchmark=cpp_logger\n"
             << "# threads=" << options.common.threadCount
             << ", messages_per_thread=" << options.common.messagesPerThread
             << ", payload_bytes=" << options.common.payloadSize
             << ", warmups=" << options.common.warmupRuns
             << ", measured_runs=" << options.common.measuredRuns
-            << ", queue_per_thread=" << options.queueCapacityPerProducer << ", worker_threads=1\n";
+            << ", queue_per_thread=" << options.queueCapacityPerProducer
+            << ", batch_size=" << options.writeBatchSize << '\n';
 }
 
 }  // namespace
@@ -210,10 +190,9 @@ int main(int argc, char* argv[]) {
   try {
     const BenchmarkOptions options = parseOptions(argc, argv);
     const std::vector<BenchmarkProfile> profiles = {
-        {"block", "Block", spdlog::async_overflow_policy::block},
-        {"drop-newest", "DropNewest (discard_new)", spdlog::async_overflow_policy::discard_new},
-        {"drop-oldest", "DropOldest (overrun_oldest)",
-         spdlog::async_overflow_policy::overrun_oldest},
+        {"block", "Block", OverflowPolicy::Block},
+        {"drop-newest", "DropNewest", OverflowPolicy::DropNewest},
+        {"drop-oldest", "DropOldest", OverflowPolicy::DropOldest},
     };
     validateProfiles(options, profiles);
 
@@ -246,7 +225,7 @@ int main(int argc, char* argv[]) {
     }
     return 0;
   } catch (const std::exception& error) {
-    std::cerr << "spdlog benchmark failed: " << error.what() << '\n';
+    std::cerr << "cpp_logger benchmark failed: " << error.what() << '\n';
     return 1;
   }
 }

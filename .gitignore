@@ -8,3 +8,4 @@ build-*/
 *.out
 *.exe
 comparison_benchmark_logs/
+benchmark_logs/
