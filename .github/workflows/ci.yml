@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
 
-# 验证主流平台上的构建、单元测试和 CMake 安装规则。
+# 验证主流平台上的构建、单元测试和 CMake 安装规则，并在 Linux 上执行质量门禁。
 jobs:
   build-and-test:
     name: ${{ matrix.os }}
@@ -36,3 +36,95 @@ jobs:
 
       - name: 验证安装规则
         run: cmake --install build --prefix install
+
+  clang-format:
+    name: clang-format
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 clang-format
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-format-18
+
+      - name: 检查格式
+        shell: bash
+        run: |
+          git ls-files -z -- '*.cpp' '*.h' '*.hpp' |
+            xargs -0 -r clang-format-18 --dry-run --Werror --style=file
+
+  clang-tidy:
+    name: clang-tidy
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Clang 工具链
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 clang-tidy-18 ninja-build
+
+      - name: 配置 CMake
+        run: >
+          cmake -S . -B build-clang-tidy -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DBUILD_TESTING=ON
+          -DLOGGER_BUILD_QUILL_BENCHMARK=OFF
+          -DLOGGER_BUILD_SPDLOG_BENCHMARK=OFF
+          -DLOGGER_ENABLE_CLANG_TIDY=ON
+
+      - name: 构建并执行静态分析
+        run: cmake --build build-clang-tidy --parallel
+
+  sanitizers:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: AddressSanitizer
+            build_dir: build-asan
+            cmake_option: LOGGER_ENABLE_ASAN
+            asan_options: detect_leaks=1:halt_on_error=1
+            tsan_options: ''
+          - name: ThreadSanitizer
+            build_dir: build-tsan
+            cmake_option: LOGGER_ENABLE_TSAN
+            asan_options: ''
+            tsan_options: halt_on_error=1
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Clang 工具链
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 ninja-build
+
+      - name: 配置 CMake
+        run: >
+          cmake -S . -B ${{ matrix.build_dir }} -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_COMPILER=clang++-18
+          -DBUILD_TESTING=ON
+          -DLOGGER_BUILD_BENCHMARK=OFF
+          -DLOGGER_BUILD_QUILL_BENCHMARK=OFF
+          -DLOGGER_BUILD_SPDLOG_BENCHMARK=OFF
+          -D${{ matrix.cmake_option }}=ON
+
+      - name: 构建
+        run: cmake --build ${{ matrix.build_dir }} --parallel
+
+      - name: 运行 CTest
+        env:
+          ASAN_OPTIONS: ${{ matrix.asan_options }}
+          TSAN_OPTIONS: ${{ matrix.tsan_options }}
+        run: ctest --test-dir ${{ matrix.build_dir }} --output-on-failure

@@ -29,7 +29,7 @@ English | [简体中文](README.md)
 | Observability | `droppedCount()`, `queueSize()`, and `queuePeakSize()` expose overload state. |
 | Log management | Five levels, millisecond timestamps, thread IDs, source locations, and date/size rotation. |
 | Extensible output | Built-in `FileSink` and `ConsoleSink`, plus custom `LogSink` support. |
-| Engineering support | CTest, cross-platform GitHub Actions, CMake installation, and `find_package` package export. |
+| Engineering support | CTest, cross-platform GitHub Actions, format/static-analysis/Sanitizer gates, CMake installation, and `find_package` package export. |
 
 ## 🧭 Contents
 
@@ -164,7 +164,11 @@ Files use `<prefix>_<date>_<index>.log`, for example `app_2026-06-25_0.log`.
 
 ## ✅ Tests, CI, and Installation
 
-On every push to `main` and every pull request, GitHub Actions configures, builds, runs CTest, and validates CMake installation on Windows, Linux, and macOS.
+On every push to `main` and every pull request, GitHub Actions configures, builds, runs CTest, and validates CMake installation on Windows, Linux, and macOS. Linux also runs these quality gates:
+
+- `clang-format-18` performs a read-only format check on every tracked C++ source file.
+- A Clang build enables the defect, performance, and readability checks in `.clang-tidy`; every enabled diagnostic fails the build.
+- Separate AddressSanitizer (ASan) and ThreadSanitizer (TSan) builds run CTest.
 
 Run tests locally:
 
@@ -173,6 +177,27 @@ ctest --test-dir build --output-on-failure
 ```
 
 Tests cover queue lifecycle, full-queue policies, configuration validation, level filtering, safe drain on shutdown, file rotation, reinitialization, and concurrent logging.
+
+### Reproduce Quality Checks Locally
+
+`LOGGER_ENABLE_CLANG_TIDY` runs static analysis while project targets compile. `LOGGER_ENABLE_ASAN` and `LOGGER_ENABLE_TSAN` are mutually exclusive and are currently intended for Linux with Clang/GNU; they affect this project build only and are not propagated to package consumers.
+
+```bash
+# clang-format (Bash / Git Bash)
+git ls-files -z -- '*.cpp' '*.h' '*.hpp' | xargs -0 clang-format --dry-run --Werror --style=file
+
+# clang-tidy
+cmake -S . -B build-clang-tidy -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++ -DBUILD_TESTING=ON -DLOGGER_ENABLE_CLANG_TIDY=ON
+cmake --build build-clang-tidy --parallel
+```
+
+To reproduce ASan on Linux (replace `ASAN` with `TSAN` for the other check; do not enable both):
+
+```bash
+cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++ -DBUILD_TESTING=ON -DLOGGER_BUILD_BENCHMARK=OFF -DLOGGER_ENABLE_ASAN=ON
+cmake --build build-asan --parallel
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ctest --test-dir build-asan --output-on-failure
+```
 
 ### Use as a CMake Package
 
@@ -282,8 +307,8 @@ The cpp_logger and Quill rows were measured on 2026-07-26 using Windows, MSYS2 M
 ## 🗺️ Roadmap
 
 - [x] Console and pluggable output sinks
+- [x] clang-format, clang-tidy, ASan, and TSan quality gates
 - [ ] Log-retention and automatic-cleanup policies
-- [ ] More CI checks, including formatting and static analysis
 
 ## 🤝 Contributing
 

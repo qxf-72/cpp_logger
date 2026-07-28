@@ -29,7 +29,7 @@
 | 可观测性 | `droppedCount()`、`queueSize()`、`queuePeakSize()` 用于监控过载情况。 |
 | 日志管理 | 五级过滤、毫秒时间戳、线程 ID、源位置、按日期/大小滚动。 |
 | 输出端扩展 | 内置 `FileSink`、`ConsoleSink`，可接入自定义 `LogSink`。 |
-| 工程化交付 | CTest、跨平台 GitHub Actions、CMake 安装与 `find_package` 包导出。 |
+| 工程化交付 | CTest、跨平台 GitHub Actions、格式化/静态分析/Sanitizer 门禁、CMake 安装与 `find_package` 包导出。 |
 
 ## 🧭 导航
 
@@ -164,7 +164,11 @@ flowchart LR
 
 ## ✅ 测试、CI 与安装
 
-每次推送到 `main` 或创建 Pull Request 时，GitHub Actions 会在 Windows、Linux、macOS 上执行配置、构建、CTest 和 CMake 安装验证。
+每次推送到 `main` 或创建 Pull Request 时，GitHub Actions 会在 Windows、Linux、macOS 上执行配置、构建、CTest 和 CMake 安装验证；并在 Linux 上执行以下质量门禁：
+
+- 使用 `clang-format-18` 对所有受版本控制的 C++ 源文件进行只读格式检查；
+- 以 Clang 编译并启用 `.clang-tidy` 中的缺陷、性能与可读性规则，任何已启用诊断都会令构建失败；
+- 分别以 AddressSanitizer（ASan）和 ThreadSanitizer（TSan）插桩构建并运行 CTest。
 
 本地仅运行测试：
 
@@ -173,6 +177,27 @@ ctest --test-dir build --output-on-failure
 ```
 
 测试覆盖队列生命周期、满队列策略、初始化参数校验、日志过滤、安全停止排空、文件滚动、重新初始化和多线程写入。
+
+### 本地复现质量检查
+
+`LOGGER_ENABLE_CLANG_TIDY` 会在构建各项目标时运行静态分析。`LOGGER_ENABLE_ASAN` 与 `LOGGER_ENABLE_TSAN` 互斥，当前固定用于 Linux + Clang/GNU 环境；它们只影响本项目构建，不会传播给安装包消费者。
+
+```bash
+# clang-format（Bash / Git Bash）
+git ls-files -z -- '*.cpp' '*.h' '*.hpp' | xargs -0 clang-format --dry-run --Werror --style=file
+
+# clang-tidy
+cmake -S . -B build-clang-tidy -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++ -DBUILD_TESTING=ON -DLOGGER_ENABLE_CLANG_TIDY=ON
+cmake --build build-clang-tidy --parallel
+```
+
+在 Linux 上复现 ASan（将 `ASAN` 改为 `TSAN` 即可运行另一套检查，二者不可同时开启）：
+
+```bash
+cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_COMPILER=clang++ -DBUILD_TESTING=ON -DLOGGER_BUILD_BENCHMARK=OFF -DLOGGER_ENABLE_ASAN=ON
+cmake --build build-asan --parallel
+ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 ctest --test-dir build-asan --output-on-failure
+```
 
 ### 作为 CMake 包使用
 
@@ -282,8 +307,8 @@ Quill 的可靠与丢新 Profile 必须使用独立可执行程序；spdlog 的 
 ## 🗺️ 后续计划
 
 - [x] 支持控制台与可插拔输出端
+- [x] 建立 clang-format、clang-tidy、ASan 与 TSan 质量门禁
 - [ ] 支持日志文件保留期与自动清理
-- [ ] 补充更多持续集成检查（格式化、静态分析）
 
 ## 🤝 贡献
 

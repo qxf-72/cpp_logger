@@ -1,5 +1,7 @@
 build/
 build-ninja/
+# 本地质量检查和多配置 CMake 构建目录
+build-*/
 .gitignore
 .vscode/
 *.o

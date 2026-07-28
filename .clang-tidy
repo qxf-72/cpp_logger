@@ -1,0 +1,16 @@
+# 保持规则集聚焦于真实缺陷、常见性能问题和低争议的可读性问题，避免存量风格告警淹没 CI。
+Checks: >-
+  -*,
+  clang-analyzer-*,
+  bugprone-use-after-move,
+  bugprone-suspicious-memory-comparison,
+  bugprone-undefined-memory-manipulation,
+  performance-move-const-arg,
+  performance-noexcept-move-constructor,
+  readability-container-size-empty,
+  readability-redundant-control-flow
+
+# 任何已启用的诊断都会令质量门禁失败，确保新增问题不会被悄悄放过。
+WarningsAsErrors: '*'
+HeaderFilterRegex: '.*'
+FormatStyle: file

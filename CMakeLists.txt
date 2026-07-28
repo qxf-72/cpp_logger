@@ -6,6 +6,60 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# 以下开关仅服务于本项目的质量检查，不会导出给通过 find_package() 使用本库的消费者。
+option(LOGGER_ENABLE_CLANG_TIDY "Run clang-tidy while compiling project targets" OFF)
+option(LOGGER_ENABLE_ASAN "Enable AddressSanitizer for project targets" OFF)
+option(LOGGER_ENABLE_TSAN "Enable ThreadSanitizer for project targets" OFF)
+
+if(LOGGER_ENABLE_ASAN AND LOGGER_ENABLE_TSAN)
+    message(FATAL_ERROR
+        "LOGGER_ENABLE_ASAN and LOGGER_ENABLE_TSAN cannot be enabled at the same time")
+endif()
+
+if(LOGGER_ENABLE_CLANG_TIDY)
+    find_program(LOGGER_CLANG_TIDY_EXECUTABLE
+        NAMES clang-tidy clang-tidy-18 clang-tidy-17
+    )
+
+    if(NOT LOGGER_CLANG_TIDY_EXECUTABLE)
+        message(FATAL_ERROR
+            "LOGGER_ENABLE_CLANG_TIDY=ON requires clang-tidy. Install it or add it to PATH.")
+    endif()
+
+    # 仅把静态分析附加到本项目 target，避免第三方依赖也被纳入质量门禁。
+    set(LOGGER_CLANG_TIDY_COMMAND
+        "${LOGGER_CLANG_TIDY_EXECUTABLE};--warnings-as-errors=*")
+endif()
+
+function(logger_enable_clang_tidy target)
+    if(LOGGER_ENABLE_CLANG_TIDY)
+        set_property(TARGET ${target} PROPERTY CXX_CLANG_TIDY "${LOGGER_CLANG_TIDY_COMMAND}")
+    endif()
+endfunction()
+
+if(LOGGER_ENABLE_ASAN OR LOGGER_ENABLE_TSAN)
+    # CI 固定在 Linux 上运行 Sanitizer，避免不同平台运行时支持不一致导致结果失真。
+    if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        message(FATAL_ERROR
+            "LOGGER_ENABLE_ASAN and LOGGER_ENABLE_TSAN are currently supported only on Linux")
+    endif()
+
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        message(FATAL_ERROR
+            "LOGGER_ENABLE_ASAN and LOGGER_ENABLE_TSAN require a Clang or GNU compiler")
+    endif()
+
+    if(LOGGER_ENABLE_ASAN)
+        set(LOGGER_SANITIZER_FLAG "-fsanitize=address")
+    else()
+        set(LOGGER_SANITIZER_FLAG "-fsanitize=thread")
+    endif()
+
+    # 静态库和最终可执行文件都需要插桩；链接选项不通过导出 target 传播给安装包消费者。
+    add_compile_options(${LOGGER_SANITIZER_FLAG} -fno-omit-frame-pointer)
+    add_link_options(${LOGGER_SANITIZER_FLAG})
+endif()
+
 find_package(Threads REQUIRED)
 include(CMakePackageConfigHelpers)
 # 启用 CTest，并提供可由调用方关闭的 BUILD_TESTING 选项。
@@ -17,6 +71,7 @@ add_library(logger STATIC
     src/LogSink.cpp
     src/Logger.cpp
 )
+logger_enable_clang_tidy(logger)
 
 add_library(cpp_logger::logger ALIAS logger)
 
@@ -87,6 +142,7 @@ install(FILES
 add_executable(logger_demo
     examples/example.cpp
 )
+logger_enable_clang_tidy(logger_demo)
 
 target_link_libraries(logger_demo PRIVATE
     logger
@@ -102,6 +158,7 @@ if(LOGGER_BUILD_BENCHMARK)
     add_executable(logger_benchmark
         benchmark/benchmark.cpp
     )
+    logger_enable_clang_tidy(logger_benchmark)
 
     target_link_libraries(logger_benchmark PRIVATE
         logger
@@ -142,6 +199,7 @@ if(LOGGER_BUILD_SPDLOG_BENCHMARK)
     add_executable(logger_spdlog_benchmark
         benchmark/spdlog_benchmark.cpp
     )
+    logger_enable_clang_tidy(logger_spdlog_benchmark)
     target_link_libraries(logger_spdlog_benchmark PRIVATE
         spdlog::spdlog_header_only
     )
@@ -187,6 +245,7 @@ if(LOGGER_BUILD_QUILL_BENCHMARK)
     add_executable(logger_quill_blocking_benchmark
         benchmark/comparison_benchmark.cpp
     )
+    logger_enable_clang_tidy(logger_quill_blocking_benchmark)
     target_compile_definitions(logger_quill_blocking_benchmark PRIVATE LOGGER_QUILL_QUEUE_MODE=1)
     target_link_libraries(logger_quill_blocking_benchmark PRIVATE
         logger
@@ -196,6 +255,7 @@ if(LOGGER_BUILD_QUILL_BENCHMARK)
     add_executable(logger_quill_dropping_benchmark
         benchmark/comparison_benchmark.cpp
     )
+    logger_enable_clang_tidy(logger_quill_dropping_benchmark)
     target_compile_definitions(logger_quill_dropping_benchmark PRIVATE LOGGER_QUILL_QUEUE_MODE=2)
     target_link_libraries(logger_quill_dropping_benchmark PRIVATE
         logger
@@ -208,6 +268,7 @@ if(BUILD_TESTING)
     add_executable(logger_tests
         tests/logger_tests.cpp
     )
+    logger_enable_clang_tidy(logger_tests)
 
     target_link_libraries(logger_tests PRIVATE
         logger

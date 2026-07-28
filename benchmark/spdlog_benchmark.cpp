@@ -144,9 +144,8 @@ fs::path makeRunDirectory(const BenchmarkOptions& options, const BenchmarkProfil
                           std::size_t runIndex) {
   const auto timestamp = std::chrono::steady_clock::now().time_since_epoch().count();
   const fs::path directory =
-      options.outputDirectory /
-      (std::string(profile.id) + "_spdlog_run_" + std::to_string(runIndex) + "_" +
-       std::to_string(timestamp));
+      options.outputDirectory / (std::string(profile.id) + "_spdlog_run_" +
+                                 std::to_string(runIndex) + "_" + std::to_string(timestamp));
   std::error_code error;
   fs::create_directories(directory, error);
   if (error) {
@@ -319,8 +318,7 @@ int main(int argc, char* argv[]) {
   try {
     const BenchmarkOptions options = parseOptions(argc, argv);
     const std::vector<BenchmarkProfile> profiles = {
-        {"reliable_periodic", "Reliable / periodic", "Block",
-         spdlog::async_overflow_policy::block},
+        {"reliable_periodic", "Reliable / periodic", "Block", spdlog::async_overflow_policy::block},
         // v1.17.0 的 discard_new 与 cpp_logger 的 DropNewest 都是队列满时拒绝
         // 当前新记录，因此可以用于“容忍丢失 / 丢新”的语义对照。
         {"discard_new", "Loss-tolerant / discard newest", "DiscardNew",
@@ -341,26 +339,27 @@ int main(int argc, char* argv[]) {
       }
     }
 
-    std::cout << "# spdlog asynchronous file benchmark\n"
-              << "# spdlog_version=" << SPDLOG_VER_MAJOR << '.' << SPDLOG_VER_MINOR << '.'
-              << SPDLOG_VER_PATCH << ", threads=" << options.threadCount
-              << ", messages_per_thread=" << options.messagesPerThread
-              << ", payload_bytes=" << options.payloadSize << ", runs=" << options.runs << '\n'
-              << "# queue=" << queueCapacity(options)
-              << " records total, worker_threads=1, flush=Periodic 1 s\n"
-              << "# Producer throughput counts all attempted submissions; end-to-end throughput "
-                 "counts records retained after overflow handling and completely flushed to the file.\n\n"
-              << "| Scenario | Implementation | Queue policy | Queue capacity | Flush policy | "
-                 "Producer logs/s | End-to-end logs/s | Drop rate |\n"
-              << "| --- | --- | --- | --- | --- | ---: | ---: | ---: |\n"
-              << std::flush;
+    std::cout
+        << "# spdlog asynchronous file benchmark\n"
+        << "# spdlog_version=" << SPDLOG_VER_MAJOR << '.' << SPDLOG_VER_MINOR << '.'
+        << SPDLOG_VER_PATCH << ", threads=" << options.threadCount
+        << ", messages_per_thread=" << options.messagesPerThread
+        << ", payload_bytes=" << options.payloadSize << ", runs=" << options.runs << '\n'
+        << "# queue=" << queueCapacity(options)
+        << " records total, worker_threads=1, flush=Periodic 1 s\n"
+        << "# Producer throughput counts all attempted submissions; end-to-end throughput "
+           "counts records retained after overflow handling and completely flushed to the file.\n\n"
+        << "| Scenario | Implementation | Queue policy | Queue capacity | Flush policy | "
+           "Producer logs/s | End-to-end logs/s | Drop rate |\n"
+        << "| --- | --- | --- | --- | --- | ---: | ---: | ---: |\n"
+        << std::flush;
 
     for (const BenchmarkProfile& profile : profiles) {
       if (!shouldRunProfile(options, profile.id)) {
         continue;
       }
-      const AggregateResult result =
-          runRepeated(options, [&](std::size_t runIndex) { return runSpdlog(options, profile, runIndex); });
+      const AggregateResult result = runRepeated(
+          options, [&](std::size_t runIndex) { return runSpdlog(options, profile, runIndex); });
       printResult(options, profile, result);
     }
     return 0;
