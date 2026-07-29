@@ -142,17 +142,110 @@ int main() {
 
 ```mermaid
 flowchart LR
-    P[Application thread] --> R[Capture LogRecord]
-    R --> Q[Bounded BlockingQueue]
-    Q --> W[Background logger thread]
-    W --> F[Format a batch]
-    F --> S[FileSink / ConsoleSink / custom sink]
-    S --> D[Write a batch]
+    subgraph Frontend[Application thread: low-latency submission path]
+        P[LOG_INFO / Logger::logStatic]
+        L[Level fast path and lifecycle check]
+        R[Capture LogRecord]
+        P --> L --> R
+    end
+
+    subgraph Buffer[Thread-safe buffer]
+        Q[Bounded BlockingQueue]
+        O{Queue full?}
+        B[Block: wait for capacity]
+        N[DropNewest: reject incoming record]
+        E[DropOldest: evict oldest record]
+        R --> Q --> O
+        O --> B
+        O --> N
+        O --> E
+    end
+
+    subgraph Backend[One backend thread: formatting and I/O]
+        W[Pop a batch]
+        F[Format a batch]
+        S[Fan out the same batch to every sink]
+        Q --> W --> F --> S
+    end
+
+    subgraph Sinks[Output sinks]
+        FS[FileSink: buffer, rotate, write]
+        CS[ConsoleSink]
+        XS[Custom LogSink]
+        S --> FS
+        S --> CS
+        S --> XS
+    end
 ```
 
-- Application threads capture the timestamp, level, thread ID, source location, and message, then enqueue the record; string formatting is deferred to the backend thread.
-- `stop()` rejects later writes, drains accepted records, flushes, and closes all sinks.
-- Lifecycle synchronization and queue generations prevent producers from an old lifecycle from writing into a reinitialized queue.
+### Component responsibilities
+
+| Component | Responsibility | Thread / synchronization boundary |
+| --- | --- | --- |
+| `Logger` | Public API, level filtering, and lifecycle management; application threads only create raw `LogRecord` objects. | `shouldLog()` uses atomic fast-path checks; submission briefly reads lifecycle state and the queue generation. |
+| `BlockingQueue<LogRecord>` | Bounded buffering, three full-queue policies, close wakeups, and drop/length/high-water statistics. | Internal mutex plus `notEmpty` / `notFull` condition variables. |
+| `workerLoop()` | Batch dequeue, formatting, fan-out, and policy-driven flushing. | The single backend thread keeps formatting and file I/O off application threads. |
+| `FileSink` | Date/size rotation, batch text staging, and stream writes. | Called serially by the backend, so application threads do not contend for a file lock. |
+| `ConsoleSink` / custom `LogSink` | Receives the same formatted batch as the file sink. | Called by the backend; a slow custom sink affects overall write capacity. |
+
+### Hot path and batched writes
+
+Application threads capture the call timestamp, level, thread ID, source location, and body, then enqueue those fields as a `LogRecord`; they **do not construct the final log line**. The backend removes up to `writeBatchSize` records at once, reuses batch containers while formatting, and broadcasts the formatted batch to every sink.
+
+`FileSink` appends a whole batch to an in-memory `pending` buffer and performs one `ostream::write()`. This avoids per-record `operator<<`, repeated locking, and frequent system calls; the date prefix is also cached per second. The trade-off is that the queue, memory budget, and backend thread together bound write capacity, so queue capacity and overflow policy must match the application's loss and latency budget.
+
+`LOG_*` first calls the lock-free `shouldLog()` fast path, so a level-filtered message need not be constructed. The real submission path checks lifecycle state and level again for concurrent correctness. `logStatic()` is for static-lifetime file names such as `__FILE__` and avoids copying them; ordinary `log()` copies the file name. The message body is always copied into `LogRecord`, so callers may safely pass temporary strings or `std::string_view` values.
+
+### Concurrency and lifecycle
+
+```mermaid
+sequenceDiagram
+    participant P as Application thread
+    participant L as Logger
+    participant Q as BlockingQueue
+    participant W as Backend thread
+    participant S as Sink
+
+    P->>L: LOG_INFO(message)
+    L->>L: Atomic level fast path
+    L->>L: Read current queue generation
+    L->>Q: push(generation, LogRecord)
+    Q-->>P: Enqueued / dropped / closed
+    W->>Q: popBatch(...)
+    Q-->>W: Batch of LogRecord objects
+    W->>W: Format batch
+    W->>S: writeBatch(formattedBatch)
+
+    Note over L,Q: stop() sets running=false and closes the queue
+    Q-->>P: Wake producers blocked by Block
+    W->>Q: Drain records accepted before close
+    W->>S: flush() / close()
+```
+
+- A `Block` submission does not hold `Logger`'s lifecycle shared lock while waiting for capacity. `stop()` can therefore take the exclusive lock, close the queue, and wake waiting producers without a shutdown deadlock.
+- `stop()` rejects new records, drains accepted records, flushes, and closes every sink. It is not `fsync`, so it does not provide power-loss durability.
+- `init()` and `stop()` take the lifecycle exclusive lock. Each reinitialization resets the queue and increments its **generation**. A producer from an old lifecycle that later reaches `push()` carries the old generation and is rejected; it cannot write an old record into the new file lifecycle.
+- `droppedCount()`, `queueSize()`, and `queuePeakSize()` are scoped to the current initialization. A successful `init()` starts them from zero.
+
+### Flush semantics
+
+| Policy | Backend behavior | Trade-off |
+| --- | --- | --- |
+| `OnStop` | Does not actively flush while running; flushes once the queue is drained during shutdown. | Throughput-first; recent output may remain in the stream buffer after an abnormal exit. |
+| `Periodic` | Uses timed batch dequeue and flushes at `flushInterval`, even when no new record arrives. | The usual balance of throughput and visibility. |
+| `EveryBatch` | Flushes after every written batch. | Better visibility at a higher flush cost. |
+
+Regardless of the policy, `flushAtOrAbove` immediately flushes a batch that contains a record at or above the configured severity.
+
+### Source layout
+
+```text
+include/Logger.h        public API, LoggerConfig, log macros, and LogRecord definition
+include/BlockingQueue.h bounded queue, overflow policies, generations, and statistics
+include/LogSink.h       pluggable sink abstraction
+src/Logger.cpp          lifecycle, backend loop, batch formatting, and flush policies
+src/LogSink.cpp         FileSink / ConsoleSink, batch writes, and file rotation
+```
 
 The log line format is:
 

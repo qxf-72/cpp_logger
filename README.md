@@ -142,17 +142,110 @@ int main() {
 
 ```mermaid
 flowchart LR
-    P[业务线程] --> R[采集 LogRecord]
-    R --> Q[有界 BlockingQueue]
-    Q --> W[后台日志线程]
-    W --> F[批量格式化]
-    F --> S[FileSink / ConsoleSink / 自定义 Sink]
-    S --> D[批量输出]
+    subgraph Frontend[业务线程：低延迟提交路径]
+        P[LOG_INFO / Logger::logStatic]
+        L[级别快筛与生命周期复核]
+        R[采集 LogRecord]
+        P --> L --> R
+    end
+
+    subgraph Buffer[线程安全缓冲层]
+        Q[有界 BlockingQueue]
+        O{队列是否已满？}
+        B[Block：等待空位]
+        N[DropNewest：拒绝新记录]
+        E[DropOldest：淘汰最旧记录]
+        R --> Q --> O
+        O --> B
+        O --> N
+        O --> E
+    end
+
+    subgraph Backend[单个后台线程：格式化与 I/O]
+        W[批量出队]
+        F[批量格式化]
+        S[向全部 Sink 分发同一批记录]
+        Q --> W --> F --> S
+    end
+
+    subgraph Sinks[输出端]
+        FS[FileSink：缓存、滚动、写文件]
+        CS[ConsoleSink]
+        XS[自定义 LogSink]
+        S --> FS
+        S --> CS
+        S --> XS
+    end
 ```
 
-- 业务线程采集时间、级别、线程 ID、源位置和消息后入队；字符串格式化延后到后台线程。
-- `stop()` 拒绝后续写入、排空已接收记录、刷新并关闭全部 Sink。
-- 生命周期同步与队列代次避免旧生命周期的生产者在重新初始化后写入新队列。
+### 组件职责
+
+| 组件 | 职责 | 所在线程 / 同步边界 |
+| --- | --- | --- |
+| `Logger` | 对外 API、级别过滤、生命周期管理；业务线程只创建原始 `LogRecord`。 | `shouldLog()` 使用原子变量快筛；提交时短暂读取生命周期和队列代次。 |
+| `BlockingQueue<LogRecord>` | 有界缓冲、三种满队列策略、关闭唤醒、丢弃/长度/峰值统计。 | 内部互斥锁 + `notEmpty` / `notFull` 条件变量。 |
+| `workerLoop()` | 批量出队、格式化、分发、按策略刷新。 | 唯一后台线程；不让格式化与文件 I/O 占用业务线程。 |
+| `FileSink` | 按日期或大小滚动、暂存整批文本并一次写入流。 | 由后台线程串行调用，无需让业务线程竞争文件锁。 |
+| `ConsoleSink` / 自定义 `LogSink` | 接收与文件 Sink 相同的已格式化批次。 | 由后台线程调用；自定义 Sink 的耗时会影响整体写入能力。 |
+
+### 热路径与批量写入
+
+业务线程会采集调用时刻、级别、线程 ID、源位置和正文，并将它们作为 `LogRecord` 入队；**不在业务线程拼接最终日志行**。后台线程一次取出至多 `writeBatchSize` 条记录，复用批量容器完成格式化，再把同一批已格式化文本广播给所有 Sink。
+
+`FileSink` 会先把一批记录追加到内存中的 `pending` 缓冲，再执行一次 `ostream::write()`。这减少了逐条 `operator<<`、频繁锁竞争和系统调用的开销；日期前缀也会按秒缓存。代价是队列、内存和后台线程成为写入能力的共同上限，因此应按业务的可靠性与延迟目标选择溢出策略和容量。
+
+`LOG_*` 宏先调用无锁的 `shouldLog()`，让被级别过滤的消息不产生构造开销；真正入队前仍会复核运行状态和级别，以保证并发安全。`logStatic()` 面向 `__FILE__` 这类静态生命周期文件名，避免复制它；普通 `log()` 会复制文件名。消息正文始终被复制到 `LogRecord`，因此调用方可传入临时字符串或 `std::string_view`。
+
+### 并发与生命周期
+
+```mermaid
+sequenceDiagram
+    participant P as 业务线程
+    participant L as Logger
+    participant Q as BlockingQueue
+    participant W as 后台线程
+    participant S as Sink
+
+    P->>L: LOG_INFO(message)
+    L->>L: 原子级别快筛
+    L->>L: 读取当前队列代次
+    L->>Q: push(generation, LogRecord)
+    Q-->>P: 已入队 / 被丢弃 / 已关闭
+    W->>Q: popBatch(...)
+    Q-->>W: 一批 LogRecord
+    W->>W: 格式化整批记录
+    W->>S: writeBatch(formattedBatch)
+
+    Note over L,Q: stop() 先将 running=false 并 close() 队列
+    Q-->>P: 唤醒因 Block 等待的生产者
+    W->>Q: 排空关闭前已接收的记录
+    W->>S: flush() / close()
+```
+
+- `Block` 入队等待空位时不会持有 `Logger` 的生命周期共享锁，因此 `stop()` 能取得独占锁、关闭队列并唤醒等待者，不会形成停止死锁。
+- `stop()` 的语义是：拒绝新的记录、排空已接收记录、刷新并关闭全部 Sink。它不是 `fsync`，因此不承诺断电安全。
+- `init()` 与 `stop()` 持生命周期独占锁；每次重新初始化都会重置队列并递增**队列代次**。旧生命周期中已读取到旧代次的生产者，即使稍后才执行入队，也会因代次不匹配而被拒绝，不能把旧日志写入新文件周期。
+- `droppedCount()`、`queueSize()` 与 `queuePeakSize()` 都是当前初始化周期的统计；成功 `init()` 后从零开始。
+
+### 刷新语义
+
+| 策略 | 后台线程行为 | 适用取舍 |
+| --- | --- | --- |
+| `OnStop` | 正常运行时不主动刷新，停止排空时统一刷新。 | 吞吐优先；异常退出时最近内容可能仍留在流缓冲。 |
+| `Periodic` | 使用带超时的批量出队，到达 `flushInterval` 时刷新，即使暂时没有新日志。 | 常用的吞吐与可见性平衡。 |
+| `EveryBatch` | 每写完一个批次立即刷新。 | 可见性更高，但刷新开销更大。 |
+
+无论选择哪种策略，`flushAtOrAbove` 都可以让包含指定严重级别及以上记录的批次立刻刷新。
+
+### 目录对应关系
+
+```text
+include/Logger.h        公开 API、LoggerConfig、日志宏与 LogRecord 定义
+include/BlockingQueue.h 有界队列、溢出策略、代次与统计
+include/LogSink.h       可插拔 Sink 抽象
+src/Logger.cpp          生命周期、后台循环、批量格式化与刷新策略
+src/LogSink.cpp         FileSink / ConsoleSink、批量写入与文件滚动
+```
 
 日志行格式：
 
